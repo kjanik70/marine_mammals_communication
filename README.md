@@ -31,7 +31,7 @@ Both tracks use the **same GPT-style causal transformer** — only the vocabular
 | Coda sequences (tiny) | 8,718 codas | 6.3M | 12.61 | 59.4% | 86.0% |
 | Dialogues (tiny) | 219 multi-whale dialogues | 6.3M | 3.40 | 59.6% | 95.0% |
 
-### Audio Models
+### Audio Models — 1 Codebook
 
 | Model | Data | Segments | Params | Val Loss | Perplexity |
 |-------|------|----------|--------|----------|------------|
@@ -41,6 +41,17 @@ Both tracks use the **same GPT-style causal transformer** — only the vocabular
 | Toothed cetaceans (small) | Odontoceti | 10,462 | 34M | 2.68 | 14.5 |
 | **Baleen whales (small)** | **Mysticeti** | **29,560** | **34M** | **1.01** | **2.7** |
 | **All species (tiny)** | **9 sources** | **39,394** | **6.6M** | **1.63** | **5.1** |
+
+### Audio Models — 4 Codebooks + Sequence Concatenation
+
+These models use 4 interleaved LAC codebooks for richer audio representation and concatenate segments from the same source with SEP tokens to learn cross-vocalization patterns. Sequences use sliding windows (50% overlap) up to 1024 tokens.
+
+| Model | Data | Windows | Params | Val Loss | Perplexity | Notes |
+|-------|------|---------|--------|----------|------------|-------|
+| All species (tiny, 4CB) | 9 sources | 25,143 | 7.3M | 3.59 | 36.2 | 200 epochs, ~194 min |
+| **Baleen whales (small, 4CB)** | **Mysticeti** | **16,663** | **35.7M** | **2.70** | **14.8** | **Early stopped epoch 34, ~107 min** |
+
+> **Note**: Val loss is not directly comparable between 1CB and 4CB models — the 4CB vocabulary is 4x larger (4099 vs 1026), making per-token prediction harder. The real comparison is in generated audio quality: 4CB captures finer spectral detail that 1CB misses.
 
 ## Quick Start
 
@@ -134,11 +145,19 @@ For the extended datasets (see [Data Sources](#data-sources) below for manual do
 ```bash
 export PYTHONPATH=.
 
+# === 1 Codebook (original) ===
 # Tokenize all datasets into data/tokenized/all/
-python3 scripts/tokenize_all_audio.py
+python3 scripts/tokenize_all_audio.py --n-codebooks 1
 
-# Or organize by species group (toothed/baleen/sperm_whale)
-python3 scripts/organize_species.py
+# Organize by species group (toothed/baleen/sperm_whale)
+python3 scripts/organize_species.py --n-codebooks 1
+
+# === 4 Codebooks (richer representation) ===
+# Tokenize all datasets into data/tokenized/all_4cb/
+python3 scripts/tokenize_all_audio.py --n-codebooks 4
+
+# Organize by species group into *_4cb/ directories
+python3 scripts/organize_species.py --n-codebooks 4
 ```
 
 ### 5. Train models
@@ -153,7 +172,7 @@ python3 scripts/train.py configs/symbolic_tiny.yaml
 # Multi-whale dialogues
 python3 scripts/train.py configs/symbolic_tiny_dialogue.yaml
 
-# === Track 2: Audio ===
+# === Track 2: Audio (1 codebook) ===
 # Single-species (DSWP sperm whale only)
 python3 scripts/train.py configs/audio_small.yaml
 
@@ -165,7 +184,11 @@ python3 scripts/train.py configs/audio_small_sperm.yaml
 python3 scripts/train.py configs/audio_small_toothed.yaml
 python3 scripts/train.py configs/audio_small_baleen.yaml
 
-# Or run all sequentially:
+# === Track 2: Audio (4 codebooks + sequence concatenation) ===
+python3 scripts/train.py configs/audio_tiny_all_4cb.yaml
+python3 scripts/train.py configs/audio_small_baleen_4cb.yaml
+
+# Or run all 1CB models sequentially:
 bash scripts/train_all.sh
 ```
 
@@ -226,10 +249,21 @@ Audio is tokenized using WhAM's trained LAC (Learned Audio Codec):
 - **Sample rate**: 44,100 Hz
 - **Hop length**: 768 samples
 - **Token rate**: ~57.4 tokens/sec
-- **Codebooks**: 14 (we use first codebook only = 1,024 vocab)
-- **Vocab size**: 1,026 (1,024 codes + PAD token at 0 + offset of 1)
+- **Codebooks**: 14 via RVQ (residual vector quantization)
+- **1CB mode**: First codebook only, vocab 1,026 (1,024 codes + PAD + offset)
+- **4CB mode**: 4 codebooks interleaved, vocab 4,099 (4×1024 codes + PAD + offset + SEP)
 
 Long recordings are segmented using energy-based silence detection into clips of 0.3–5 seconds before tokenization.
+
+### Multi-Codebook (4CB) Tokenization
+
+The LAC codec produces 14 codebooks via RVQ — codebook 0 captures coarse audio structure, subsequent codebooks add finer spectral detail. Using 4 codebooks gives significantly richer representation:
+
+- **Interleaving**: `[cb1_t1, cb2_t1, cb3_t1, cb4_t1, cb1_t2, cb2_t2, ...]` — each timestep produces 4 tokens
+- **Offsets**: CB0 = tokens 1–1025, CB1 = 1025–2049, CB2 = 2049–3073, CB3 = 3073–4097
+- **Special tokens**: PAD = 0, SEP = 4098 (used between concatenated segments)
+- **Sequence concatenation**: Segments from the same source are concatenated with SEP tokens, creating longer training sequences that span multiple vocalizations. This lets the model learn what sounds follow other sounds across clip boundaries.
+- **Sliding windows**: Concatenated sequences are split into windows of up to 1024 tokens with 50% overlap.
 
 ## Model Architecture
 
@@ -258,12 +292,14 @@ All configs are in `configs/`. Key configs:
 |--------|-------|-------|------|--------------|
 | `symbolic_tiny.yaml` | Symbolic | tiny | Individual coda sequences | LR 3e-4, batch 32, seq_len 128 |
 | `symbolic_tiny_dialogue.yaml` | Symbolic | tiny | Multi-whale dialogues | LR 3e-4, batch 32, seq_len 256 |
-| `audio_small.yaml` | Audio | small | DSWP only | LR 3e-4, batch 16, seq_len 512 |
-| `audio_tiny_all.yaml` | Audio | tiny | All species (augmented) | LR 5e-4, batch 64, dropout 0.15 |
-| `audio_small_all_aug.yaml` | Audio | small | All species (augmented) | LR 2e-4, batch 32, dropout 0.15 |
-| `audio_small_sperm.yaml` | Audio | small | Sperm whale | LR 3e-4, batch 16, seq_len 512 |
-| `audio_small_toothed.yaml` | Audio | small | Toothed cetaceans | LR 3e-4, batch 16, seq_len 512 |
-| `audio_small_baleen.yaml` | Audio | small | Baleen whales | LR 3e-4, batch 16, seq_len 512 |
+| `audio_small.yaml` | Audio 1CB | small | DSWP only | LR 3e-4, batch 16, seq_len 512 |
+| `audio_tiny_all.yaml` | Audio 1CB | tiny | All species (augmented) | LR 5e-4, batch 64, dropout 0.15 |
+| `audio_small_all_aug.yaml` | Audio 1CB | small | All species (augmented) | LR 2e-4, batch 32, dropout 0.15 |
+| `audio_small_sperm.yaml` | Audio 1CB | small | Sperm whale | LR 3e-4, batch 16, seq_len 512 |
+| `audio_small_toothed.yaml` | Audio 1CB | small | Toothed cetaceans | LR 3e-4, batch 16, seq_len 512 |
+| `audio_small_baleen.yaml` | Audio 1CB | small | Baleen whales | LR 3e-4, batch 16, seq_len 512 |
+| `audio_tiny_all_4cb.yaml` | Audio 4CB | tiny | All species (4CB + concat) | LR 5e-4, batch 32, seq_len 1024, vocab 4099 |
+| `audio_small_baleen_4cb.yaml` | Audio 4CB | small | Baleen whales (4CB + concat) | LR 2e-4, batch 8, seq_len 1024, vocab 4099 |
 
 Token-level augmentation (for audio track): random token noise (±1-3), token masking, and time stretching.
 
@@ -274,12 +310,14 @@ marine_mammals_communication/
 ├── configs/                          # YAML training configurations
 │   ├── symbolic_tiny.yaml            # Symbolic coda sequences
 │   ├── symbolic_tiny_dialogue.yaml   # Symbolic multi-whale dialogues
-│   ├── audio_small.yaml              # Audio, DSWP-only
-│   ├── audio_tiny_all.yaml           # Audio, all species (tiny model)
-│   ├── audio_small_all_aug.yaml      # Audio, all species (small + augmentation)
-│   ├── audio_small_sperm.yaml        # Audio, sperm whale group
-│   ├── audio_small_toothed.yaml      # Audio, toothed cetaceans
-│   └── audio_small_baleen.yaml       # Audio, baleen whales
+│   ├── audio_small.yaml              # Audio, DSWP-only (1CB)
+│   ├── audio_tiny_all.yaml           # Audio, all species (tiny, 1CB)
+│   ├── audio_small_all_aug.yaml      # Audio, all species (small + aug, 1CB)
+│   ├── audio_small_sperm.yaml        # Audio, sperm whale group (1CB)
+│   ├── audio_small_toothed.yaml      # Audio, toothed cetaceans (1CB)
+│   ├── audio_small_baleen.yaml       # Audio, baleen whales (1CB)
+│   ├── audio_tiny_all_4cb.yaml       # Audio, all species (tiny, 4CB + concat)
+│   └── audio_small_baleen_4cb.yaml   # Audio, baleen whales (small, 4CB + concat)
 ├── data/
 │   ├── raw/                          # Downloaded datasets (not in git)
 │   │   ├── ceti/                     # CETI annotation CSVs
@@ -293,21 +331,25 @@ marine_mammals_communication/
 │   │   ├── right_whale/              # Right whale upcalls (Kaggle)
 │   │   └── kw_pei/                   # Killer whale Prince Edward Islands
 │   └── tokenized/                    # Tokenized .npy files (not in git)
-│       ├── all/                      # All species combined
-│       ├── sperm_whale/              # Sperm whale tokens
-│       ├── toothed/                  # Toothed cetacean tokens
-│       └── baleen/                   # Baleen whale tokens
+│       ├── all/                      # All species combined (1CB)
+│       ├── sperm_whale/              # Sperm whale tokens (1CB)
+│       ├── toothed/                  # Toothed cetacean tokens (1CB)
+│       ├── baleen/                   # Baleen whale tokens (1CB)
+│       ├── all_4cb/                  # All species combined (4CB)
+│       └── baleen_4cb/               # Baleen whale tokens (4CB)
 ├── models/
 │   └── codec.pth                     # WhAM LAC codec weights (not in git)
 ├── runs/                             # Training outputs (not in git)
 │   ├── symbolic_tiny_coda/           # Symbolic coda model
 │   ├── symbolic_tiny_dialogue/       # Symbolic dialogue model
-│   ├── audio_small_dswp/             # Audio DSWP-only
-│   ├── audio_small_all/              # Audio all-species (small)
-│   ├── audio_tiny_all/               # Audio all-species (tiny)
-│   ├── audio_small_sperm/            # Audio sperm whale
-│   ├── audio_small_toothed/          # Audio toothed cetaceans
-│   └── audio_small_baleen/           # Audio baleen whales
+│   ├── audio_small_dswp/             # Audio DSWP-only (1CB)
+│   ├── audio_small_all/              # Audio all-species (small, 1CB)
+│   ├── audio_tiny_all/               # Audio all-species (tiny, 1CB)
+│   ├── audio_small_sperm/            # Audio sperm whale (1CB)
+│   ├── audio_small_toothed/          # Audio toothed cetaceans (1CB)
+│   ├── audio_small_baleen/           # Audio baleen whales (1CB)
+│   ├── audio_tiny_all_4cb/           # Audio all-species (tiny, 4CB)
+│   └── audio_small_baleen_4cb/       # Audio baleen whales (small, 4CB)
 ├── scripts/
 │   ├── download_data.py              # Download CETI + DSWP + codec pointer
 │   ├── download_more_data.py         # Download MBARI + HuggingFace datasets
@@ -360,17 +402,25 @@ python3 scripts/download_data.py
 python3 scripts/download_more_data.py
 # + manual downloads listed above for Watkins, Orcasound, Humpback, Right Whale, etc.
 
-# 4. Tokenize
-python3 scripts/tokenize_all_audio.py      # all → data/tokenized/all/
-python3 scripts/organize_species.py         # species groups → data/tokenized/{sperm_whale,toothed,baleen}/
+# 4. Tokenize (1 codebook)
+python3 scripts/tokenize_all_audio.py --n-codebooks 1   # → data/tokenized/all/
+python3 scripts/organize_species.py --n-codebooks 1      # → data/tokenized/{sperm_whale,toothed,baleen}/
 
-# 5. Train all models
+# 5. Tokenize (4 codebooks)
+python3 scripts/tokenize_all_audio.py --n-codebooks 4   # → data/tokenized/all_4cb/
+python3 scripts/organize_species.py --n-codebooks 4      # → data/tokenized/{sperm_whale_4cb,toothed_4cb,baleen_4cb}/
+
+# 6. Train 1CB models
 bash scripts/train_all.sh
 
-# 6. Generate audio samples
+# 7. Train 4CB models
+python3 scripts/train.py configs/audio_tiny_all_4cb.yaml
+python3 scripts/train.py configs/audio_small_baleen_4cb.yaml
+
+# 8. Generate audio samples
 python3 scripts/generate_all.py --n-samples 5 --max-tokens 300
 
-# 7. Evaluate symbolic models
+# 9. Evaluate symbolic models
 python3 scripts/evaluate.py runs/symbolic_tiny_coda/best_model.pt --dataset-type coda
 python3 scripts/evaluate.py runs/symbolic_tiny_dialogue/best_model.pt --dataset-type dialogue
 ```
