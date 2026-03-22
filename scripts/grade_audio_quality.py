@@ -52,6 +52,8 @@ def get_species_for_file(source: str, filepath: Path) -> str:
         return "Unknown (orcasound)"
     if source == "dori_orca":
         return "Orca"
+    if source == "dori_orca_full":
+        return "Orca"
     return "Unknown"
 
 
@@ -342,6 +344,7 @@ def main():
         ("orcasound", "data/raw/orcasound"),
         ("mbari", "data/raw/mbari"),
         ("dori_orca", "data/raw/dori_orcasound"),
+        ("dori_orca_full", "data/raw/dori_orcasound_full"),
         ("humpback_tsujii", "data/raw/humpback_zenodo"),
         ("kw_pei", "data/raw/kw_pei"),
         ("right_whale", "data/raw/right_whale/v1"),

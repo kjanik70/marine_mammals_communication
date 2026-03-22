@@ -6,6 +6,7 @@ Segments long recordings into coda-length chunks before tokenizing.
 """
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -71,9 +72,35 @@ def segment_audio(audio, sr, max_duration=5.0, min_duration=0.3, silence_thresho
     return segments
 
 
+def load_quality_filter(csv_path, min_grade="B"):
+    """Load quality grades CSV and return set of (source, file, segment_idx) that pass filter."""
+    grade_order = {"A": 5, "B": 4, "C": 3, "D": 2, "F": 1}
+    min_score = grade_order.get(min_grade, 0)
+    allowed = {}  # source -> {filename -> set of segment_idx}
+
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if grade_order.get(row["grade"], 0) >= min_score:
+                source = row["source"]
+                if source not in allowed:
+                    allowed[source] = {}
+                fname = row["file"]
+                if fname not in allowed[source]:
+                    allowed[source][fname] = set()
+                allowed[source][fname].add(int(row["segment_idx"]))
+
+    return allowed
+
+
 def process_dataset(name, audio_dir, tokenizer, output_dir, max_duration=5.0,
-                    file_patterns=("*.wav", "*.flac"), min_sr=2000):
-    """Process a dataset directory: load, segment, tokenize, save."""
+                    file_patterns=("*.wav", "*.flac"), min_sr=2000,
+                    quality_filter=None):
+    """Process a dataset directory: load, segment, tokenize, save.
+
+    If quality_filter is provided, only tokenize segments whose (file, segment_idx)
+    appears in the filter dict for this source.
+    """
     audio_dir = Path(audio_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +140,19 @@ def process_dataset(name, audio_dir, tokenizer, output_dir, max_duration=5.0,
             # Segment long recordings
             segments = segment_audio(audio, target_sr, max_duration=max_duration)
 
-            for seg in segments:
+            # Get allowed segment indices for this file (if quality filter active)
+            allowed_segs = None
+            if quality_filter is not None:
+                source_filter = quality_filter.get(name, {})
+                allowed_segs = source_filter.get(audio_path.name)
+                if allowed_segs is None:
+                    # No segments from this file passed the filter
+                    continue
+
+            for local_seg_idx, seg in enumerate(segments):
+                if allowed_segs is not None and local_seg_idx not in allowed_segs:
+                    continue
+
                 import torch
                 seg_tensor = torch.tensor(seg, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
                 codes, z = tokenizer.encode(seg_tensor)
@@ -142,12 +181,17 @@ def main():
     parser.add_argument("--n-codebooks", type=int, default=4)
     parser.add_argument("--max-duration", type=float, default=5.0,
                         help="Max segment duration in seconds")
+    parser.add_argument("--quality-csv", type=str, default=None,
+                        help="Path to audio_quality_grades.csv for filtering")
+    parser.add_argument("--min-grade", type=str, default="B",
+                        help="Minimum quality grade to include (A, B, C, D, F)")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
     if args.output_dir is None:
         suffix = f"_{args.n_codebooks}cb" if args.n_codebooks > 1 else ""
-        args.output_dir = f"data/tokenized/all{suffix}"
+        quality_suffix = f"_{args.min_grade.lower()}" if args.quality_csv else ""
+        args.output_dir = f"data/tokenized/all{suffix}{quality_suffix}"
 
     from src.tokenizer.audio_tokenizer import AudioTokenizer
 
@@ -162,6 +206,16 @@ def main():
     )
     print(f"  Sample rate: {tokenizer.sample_rate}, Tokens/sec: {tokenizer.tokens_per_second:.1f}")
 
+    # Load quality filter if specified
+    quality_filter = None
+    if args.quality_csv:
+        print(f"Loading quality filter from {args.quality_csv} (min grade: {args.min_grade})")
+        quality_filter = load_quality_filter(args.quality_csv, min_grade=args.min_grade)
+        total_allowed = sum(
+            len(segs) for files in quality_filter.values() for segs in files.values()
+        )
+        print(f"  {total_allowed} segments pass quality filter")
+
     # Define datasets to process
     datasets = [
         ("dswp", "data/raw/dswp"),
@@ -170,6 +224,7 @@ def main():
         ("orcasound", "data/raw/orcasound"),
         ("mbari", "data/raw/mbari"),
         ("dori_orca", "data/raw/dori_orcasound"),
+        ("dori_orca_full", "data/raw/dori_orcasound_full"),
         ("humpback_tsujii", "data/raw/humpback_zenodo"),
         ("kw_pei", "data/raw/kw_pei"),
         ("right_whale", "data/raw/right_whale/v1"),
@@ -188,6 +243,7 @@ def main():
         stats = process_dataset(
             name, audio_dir, tokenizer, output_dir,
             max_duration=args.max_duration,
+            quality_filter=quality_filter,
         )
         all_stats[name] = stats
         total_tokens += stats["n_tokens"]
