@@ -1,0 +1,31 @@
+# Audio: Tiny model on ALL audio — 4 codebooks + sequence concatenation
+model:
+  preset: tiny
+  vocab_size: 4099    # 4*1024 + 2 (PAD+offset) + 1 (SEP)
+  max_seq_len: 1024
+  dropout: 0.15
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/all_4cb
+  max_seq_len: 1024
+  n_codebooks: 4
+  concat: true
+  sep_token: 4098     # N_CODEBOOKS * 1024 + 2
+  augment: true
+  token_noise_prob: 0.05
+  token_mask_prob: 0.02
+  time_stretch_prob: 0.3
+
+training:
+  learning_rate: 5.0e-4
+  weight_decay: 0.1
+  batch_size: 32
+  num_epochs: 200
+  warmup_steps: 300
+  min_lr_ratio: 0.01
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 500
+  patience: 30
+  output_dir: runs/audio_tiny_all_4cb

@@ -29,35 +29,39 @@ def load_model(run_dir, device="cuda"):
     return model, ckpt.get("val_loss", float("inf"))
 
 
+def detect_n_codebooks(run_dir):
+    """Detect number of codebooks from run directory name or config."""
+    name = Path(run_dir).name
+    if "4cb" in name:
+        return 4
+    # Check for saved config
+    config_path = Path(run_dir) / "config.yaml"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        return cfg.get("data", {}).get("n_codebooks", 1)
+    return 1
+
+
 @torch.no_grad()
 def generate_audio(model, tokenizer, n_samples=5, max_tokens=200,
-                   temperature=0.9, top_k=50, device="cuda"):
+                   temperature=0.9, top_k=50, device="cuda",
+                   n_codebooks=1, sep_token=None):
     """Generate unconditional audio samples."""
+    vocab_size = model.config.vocab_size
+    # Pick a random start token from the first codebook range
+    max_start = min(1025, vocab_size - 1)
     samples = []
     for i in range(n_samples):
-        # Start with a random token
-        start_token = torch.randint(1, 1025, (1, 1), device=device)
+        start_token = torch.randint(1, max_start + 1, (1, 1), device=device)
         generated = model.generate(
             start_token, max_new_tokens=max_tokens,
             temperature=temperature, top_k=top_k, eos_token_id=-1,
         )
         tokens = generated[0].cpu().numpy()
-
-        # Decode to audio
-        codes = tokens - 1  # remove PAD offset
-        codes = np.clip(codes, 0, 1023)
-        codes_tensor = torch.tensor(codes, dtype=torch.long, device=device)
-        codes_tensor = codes_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
-
-        # Pad to 14 codebooks
-        n_codebooks = 14
-        full_codes = torch.zeros(1, n_codebooks, codes_tensor.shape[-1],
-                                 dtype=torch.long, device=device)
-        full_codes[:, 0, :] = codes_tensor[:, 0, :]
-
-        z = tokenizer.codec.quantizer.from_codes(full_codes)[0]
-        audio = tokenizer.codec.decode(z)["audio"]
-        audio_np = audio.squeeze().cpu().numpy()
+        audio_np = tokenizer.decode_tokens_to_audio(
+            tokens, n_codebooks=n_codebooks, sep_token=sep_token,
+        )
         samples.append(audio_np)
 
     return samples
@@ -72,15 +76,14 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.9)
     args = parser.parse_args()
 
-    tokenizer = AudioTokenizer(
-        codec_path=args.codec_path, device=args.device, n_codebooks=1
-    )
-
     # Find all training runs
     runs_dir = Path("runs")
     run_dirs = sorted(runs_dir.glob("audio_*"))
 
     print(f"Found {len(run_dirs)} audio training runs\n")
+
+    # Cache tokenizers by n_codebooks to avoid reloading
+    tokenizers = {}
 
     for run_dir in run_dirs:
         print(f"=== {run_dir.name} ===")
@@ -89,8 +92,17 @@ def main():
             print("  No best_model.pt found, skipping")
             continue
 
+        n_cb = detect_n_codebooks(run_dir)
+        sep_token = n_cb * 1024 + 2 if n_cb > 1 else None
+
+        if n_cb not in tokenizers:
+            tokenizers[n_cb] = AudioTokenizer(
+                codec_path=args.codec_path, device=args.device, n_codebooks=n_cb
+            )
+        tokenizer = tokenizers[n_cb]
+
         n_params = model.count_parameters()
-        print(f"  Params: {n_params:,}, Best val_loss: {val_loss:.4f}")
+        print(f"  Params: {n_params:,}, Val_loss: {val_loss:.4f}, Codebooks: {n_cb}")
 
         # Generate
         gen_dir = run_dir / "generated"
@@ -102,6 +114,8 @@ def main():
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             device=args.device,
+            n_codebooks=n_cb,
+            sep_token=sep_token,
         )
 
         for i, audio in enumerate(samples):

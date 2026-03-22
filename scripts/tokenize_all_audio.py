@@ -137,12 +137,17 @@ def process_dataset(name, audio_dir, tokenizer, output_dir, max_duration=5.0,
 def main():
     parser = argparse.ArgumentParser(description="Tokenize all audio datasets")
     parser.add_argument("--codec-path", type=str, default="models/codec.pth")
-    parser.add_argument("--output-dir", type=str, default="data/tokenized/all")
-    parser.add_argument("--n-codebooks", type=int, default=1)
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Output dir (default: data/tokenized/all or all_4cb)")
+    parser.add_argument("--n-codebooks", type=int, default=4)
     parser.add_argument("--max-duration", type=float, default=5.0,
                         help="Max segment duration in seconds")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
+
+    if args.output_dir is None:
+        suffix = f"_{args.n_codebooks}cb" if args.n_codebooks > 1 else ""
+        args.output_dir = f"data/tokenized/all{suffix}"
 
     from src.tokenizer.audio_tokenizer import AudioTokenizer
 

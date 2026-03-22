@@ -159,3 +159,55 @@ class AudioTokenizer:
         else:
             flat = self.flatten_codes(codes)
             return flat[0].cpu().numpy().astype(np.int32)
+
+    @torch.no_grad()
+    def decode_tokens_to_audio(
+        self,
+        tokens: np.ndarray,
+        n_codebooks: int = 1,
+        sep_token: int | None = None,
+    ) -> np.ndarray:
+        """Decode a 1D token sequence back to audio.
+
+        Handles both single-codebook and multi-codebook (interleaved) tokens.
+        Filters out PAD (0) and SEP tokens before decoding.
+
+        Args:
+            tokens: 1D numpy array of token IDs
+            n_codebooks: Number of codebooks used during tokenization
+            sep_token: SEP token ID to filter out (None = no filtering)
+
+        Returns:
+            audio: 1D numpy array of audio samples at codec sample rate
+        """
+        # Filter out PAD and SEP tokens
+        mask = tokens > 0
+        if sep_token is not None:
+            mask &= tokens != sep_token
+        tokens = tokens[mask]
+
+        if len(tokens) == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        if n_codebooks == 1:
+            # Single codebook: remove +1 offset, clip to [0, 1023]
+            codes = np.clip(tokens - 1, 0, 1023)
+            codes_tensor = torch.tensor(codes, dtype=torch.long, device=self.device)
+            codes_tensor = codes_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+        else:
+            # Multi-codebook: trim to multiple of n_codebooks, then unflatten
+            trim_len = (len(tokens) // n_codebooks) * n_codebooks
+            tokens = tokens[:trim_len]
+            flat_tensor = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
+            codes_tensor = self.unflatten_codes(flat_tensor, n_codebooks)
+            # Remove +1 PAD offset and clip
+            codes_tensor = torch.clamp(codes_tensor - 1, 0, 1023)
+
+        # Pad to 14 codebooks (full codec expects all codebooks)
+        T = codes_tensor.shape[-1]
+        full_codes = torch.zeros(1, 14, T, dtype=torch.long, device=self.device)
+        full_codes[:, :codes_tensor.shape[1], :] = codes_tensor
+
+        z = self.codec.quantizer.from_codes(full_codes)[0]
+        audio = self.codec.decode(z)["audio"]
+        return audio.squeeze().cpu().numpy()

@@ -85,15 +85,18 @@ def main():
     parser = argparse.ArgumentParser(description="Organize and tokenize by species group")
     parser.add_argument("--codec-path", default="models/codec.pth")
     parser.add_argument("--output-base", default="data/tokenized")
+    parser.add_argument("--n-codebooks", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-duration", type=float, default=5.0)
     args = parser.parse_args()
+
+    cb_suffix = f"_{args.n_codebooks}cb" if args.n_codebooks > 1 else ""
 
     from src.tokenizer.audio_tokenizer import AudioTokenizer
 
     print(f"Loading AudioTokenizer from {args.codec_path}...")
     tokenizer = AudioTokenizer(
-        codec_path=args.codec_path, device=args.device, n_codebooks=1
+        codec_path=args.codec_path, device=args.device, n_codebooks=args.n_codebooks
     )
 
     base = Path(args.output_base)
@@ -104,14 +107,14 @@ def main():
     sperm_files = collect_audio_files("data/raw/dswp")
     sperm_files += collect_audio_files(watkins_base / "Sperm_Whale")
     n_segs, n_toks = tokenize_audio_files(
-        sperm_files, tokenizer, base / "sperm_whale", "sperm",
+        sperm_files, tokenizer, base / f"sperm_whale{cb_suffix}", "sperm",
         max_duration=args.max_duration,
     )
     print(f"  -> {n_segs} segments, {n_toks:,} tokens")
 
     # ===== TOOTHED CETACEANS =====
     print("\n=== TOOTHED CETACEANS (Odontoceti) ===")
-    toothed_out = base / "toothed"
+    toothed_out = base / f"toothed{cb_suffix}"
     # Start with DSWP (sperm whales)
     toothed_files = collect_audio_files("data/raw/dswp")
     # Add ESP Orcas
@@ -136,7 +139,7 @@ def main():
 
     # ===== BALEEN WHALES =====
     print("\n=== BALEEN WHALES (Mysticeti) ===")
-    baleen_out = base / "baleen"
+    baleen_out = base / f"baleen{cb_suffix}"
     baleen_files = []
     # Watkins baleen species
     for species in BALEEN_SPECIES:
@@ -157,7 +160,7 @@ def main():
 
     print("\nDone! Species-specific token dirs:")
     for d in ["sperm_whale", "toothed", "baleen"]:
-        p = base / d
+        p = base / f"{d}{cb_suffix}"
         n = len(list(p.glob("*.npy"))) if p.exists() else 0
         print(f"  {p}: {n} files")
 

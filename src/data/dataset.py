@@ -164,6 +164,8 @@ class AudioTokenDataset(Dataset):
         token_noise_prob: float = 0.05,
         token_mask_prob: float = 0.02,
         time_stretch_prob: float = 0.3,
+        concat: bool = False,
+        sep_token: int | None = None,
     ):
         self.max_seq_len = max_seq_len
         self.pad_token = pad_token
@@ -172,6 +174,8 @@ class AudioTokenDataset(Dataset):
         self.token_noise_prob = token_noise_prob
         self.token_mask_prob = token_mask_prob
         self.time_stretch_prob = time_stretch_prob
+        self.concat = concat
+        self.sep_token = sep_token
 
         # Support multiple token directories
         if isinstance(token_dir, (list, tuple)):
@@ -179,13 +183,35 @@ class AudioTokenDataset(Dataset):
         else:
             token_dirs = [Path(token_dir)]
 
-        # Load all into memory (small enough for this dataset)
-        self.token_sequences = []
+        # Load all .npy files, keyed by filename for grouping
+        raw_files = []
         for td in token_dirs:
             for f in sorted(td.glob("*.npy")):
                 tokens = np.load(f)
                 if len(tokens) > 2:
-                    self.token_sequences.append(tokens)
+                    raw_files.append((f.stem, tokens))
+
+        if concat and sep_token is not None:
+            # Group files by source prefix (everything before _NNNNNN)
+            groups = {}
+            for stem, tokens in raw_files:
+                # Extract prefix: "dswp_000001" -> "dswp"
+                parts = stem.rsplit("_", 1)
+                prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else stem
+                groups.setdefault(prefix, []).append(tokens)
+
+            # Concatenate within each group with SEP tokens
+            self.token_sequences = []
+            for prefix in sorted(groups):
+                seqs = groups[prefix]
+                concat_arr = seqs[0]
+                for s in seqs[1:]:
+                    concat_arr = np.concatenate([
+                        concat_arr, np.array([sep_token], dtype=concat_arr.dtype), s
+                    ])
+                self.token_sequences.append(concat_arr)
+        else:
+            self.token_sequences = [tokens for _, tokens in raw_files]
 
         # Create sliding windows for sequences longer than max_seq_len
         self.windows = []
@@ -202,6 +228,8 @@ class AudioTokenDataset(Dataset):
         """Apply token-level data augmentation."""
         tokens = tokens.copy()
         real_mask = tokens > self.pad_token  # only augment non-pad tokens
+        if self.sep_token is not None:
+            real_mask &= tokens != self.sep_token  # don't augment SEP tokens
 
         # Token noise: perturb values by ±1-3 (like slight pitch/timing jitter)
         if self.token_noise_prob > 0:

@@ -37,13 +37,20 @@ def main():
         token_dir = cfg["data"]["token_dir"]
         augment = cfg["data"].get("augment", False)
         vocab_size = cfg["model"]["vocab_size"]
+        concat = cfg["data"].get("concat", False)
+        sep_token = cfg["data"].get("sep_token", None)
+
+        # Common dataset kwargs
+        ds_kwargs = dict(
+            max_seq_len=cfg["data"].get("max_seq_len", 512),
+            vocab_size=vocab_size,
+            concat=concat,
+            sep_token=sep_token,
+        )
 
         # Build train set (with augmentation if enabled)
         full_ds_noaug = AudioTokenDataset(
-            token_dir,
-            max_seq_len=cfg["data"].get("max_seq_len", 512),
-            vocab_size=vocab_size,
-            augment=False,
+            token_dir, augment=False, **ds_kwargs,
         )
         # Split 80/20 train/val
         n_total = len(full_ds_noaug)
@@ -60,12 +67,11 @@ def main():
             # Rebuild with augmentation for training
             full_ds_aug = AudioTokenDataset(
                 token_dir,
-                max_seq_len=cfg["data"].get("max_seq_len", 512),
-                vocab_size=vocab_size,
                 augment=True,
                 token_noise_prob=cfg["data"].get("token_noise_prob", 0.05),
                 token_mask_prob=cfg["data"].get("token_mask_prob", 0.02),
                 time_stretch_prob=cfg["data"].get("time_stretch_prob", 0.3),
+                **ds_kwargs,
             )
             train_ds = torch.utils.data.Subset(full_ds_aug, train_indices)
         else:
@@ -75,7 +81,7 @@ def main():
 
         print(f"Dataset: audio tokens from {token_dir}")
         print(f"Total windows: {n_total} (train: {n_train}, val: {n_val})")
-        print(f"Augmentation: {augment}")
+        print(f"Augmentation: {augment}, Concat: {concat}")
         print(f"Vocab size: {vocab_size}")
     else:
         # Symbolic datasets (Track 1)
