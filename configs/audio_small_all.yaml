@@ -1,0 +1,22 @@
+# Audio Track 2: Small model on ALL audio datasets combined
+model:
+  preset: small
+  vocab_size: 1026    # 1024 codebook + PAD(0) + offset(1)
+  max_seq_len: 512
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/all
+  max_seq_len: 512
+
+training:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  batch_size: 32
+  num_epochs: 100
+  warmup_steps: 200
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 500
+  patience: 20
+  output_dir: runs/audio_small_all

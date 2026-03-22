@@ -1,0 +1,28 @@
+# Audio: Small model (34M) on ALL audio with augmentation + lower min LR
+model:
+  preset: small
+  vocab_size: 1026
+  max_seq_len: 512
+  dropout: 0.15
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/all
+  max_seq_len: 512
+  augment: true
+  token_noise_prob: 0.05
+  token_mask_prob: 0.02
+  time_stretch_prob: 0.3
+
+training:
+  learning_rate: 2.0e-4
+  weight_decay: 0.15
+  batch_size: 32
+  num_epochs: 200
+  warmup_steps: 400
+  min_lr_ratio: 0.01
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 500
+  patience: 30
+  output_dir: runs/audio_small_all_aug

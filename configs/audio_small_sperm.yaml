@@ -1,0 +1,25 @@
+# Audio: Small model on sperm whale audio only (DSWP + Watkins sperm whale)
+model:
+  preset: small
+  vocab_size: 1026
+  max_seq_len: 512
+  dropout: 0.15
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/sperm_whale
+  max_seq_len: 512
+  augment: true
+
+training:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  batch_size: 32
+  num_epochs: 300
+  warmup_steps: 200
+  min_lr_ratio: 0.01
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 500
+  patience: 40
+  output_dir: runs/audio_small_sperm

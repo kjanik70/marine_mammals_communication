@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "marine-mammals-communication"
+version = "0.1.0"
+description = "Autoregressive LLM for sperm whale communication"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5.0",
+    "torchaudio>=2.5.0",
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+    "scipy>=1.12.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "datasets>=2.16.0",
+    "pandas>=2.1.0",
+]
+
+[project.optional-dependencies]
+audio-codec = [
+    "lac @ git+https://github.com/hugofloresgarcia/lac.git",
+    "descript-audiotools @ git+https://github.com/hugofloresgarcia/audiotools.git",
+]
+dev = [
+    "ipykernel>=6.0",
+    "ipywidgets>=8.0",
+    "jupyter>=1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

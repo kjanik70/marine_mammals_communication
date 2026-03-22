@@ -1,0 +1,23 @@
+# Symbolic Track 1: Tiny model on multi-whale dialogues
+model:
+  preset: tiny
+  vocab_size: 74
+  max_seq_len: 256
+
+data:
+  codas_csv: data/raw/ceti/DominicaCodas.csv
+  dialogues_csv: data/raw/ceti/sperm-whale-dialogues.csv
+  dataset_type: dialogue
+  max_seq_len: 256
+
+training:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  batch_size: 16
+  num_epochs: 300
+  warmup_steps: 100
+  log_interval: 10
+  eval_interval: 50
+  save_interval: 200
+  patience: 40
+  output_dir: runs/symbolic_tiny_dialogue
