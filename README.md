@@ -49,9 +49,27 @@ These models use 4 interleaved LAC codebooks for richer audio representation and
 | Model | Data | Windows | Params | Val Loss | Perplexity | Notes |
 |-------|------|---------|--------|----------|------------|-------|
 | All species (tiny, 4CB) | 9 sources | 25,143 | 7.3M | 3.59 | 36.2 | 200 epochs, ~194 min |
-| **Baleen whales (small, 4CB)** | **Mysticeti** | **16,663** | **35.7M** | **2.70** | **14.8** | **Early stopped epoch 34, ~107 min** |
+| Baleen whales (small, 4CB) | Mysticeti | 16,663 | 35.7M | 2.70 | 14.8 | Early stopped epoch 34, ~107 min |
+| **All species A+B (small, 4CB)** | **10 sources, quality filtered** | **19,266** | **35.7M** | **3.03** | **20.6** | **Early stopped epoch 50, ~217 min** |
 
 > **Note**: Val loss is not directly comparable between 1CB and 4CB models — the 4CB vocabulary is 4x larger (4099 vs 1026), making per-token prediction harder. The real comparison is in generated audio quality: 4CB captures finer spectral detail that 1CB misses.
+
+### Audio Quality Grading
+
+Each raw audio segment is graded A–F based on signal quality metrics (spectral flatness, peak-to-RMS ratio, energy variance, RMS energy). The "A+B" model above uses only segments graded A or B — filtering out noisy/silent segments (mostly right_whale at 2kHz and ambient MBARI hydrophone recordings).
+
+| Source | Segments | Avg Score | Grade A | Grade B | Grade C |
+|--------|----------|-----------|---------|---------|---------|
+| humpback_tsujii | 216 | 0.826 | 73% | 27% | 0% |
+| esp_orcas | 594 | 0.747 | 0% | 100% | 0% |
+| watkins | 2,909 | 0.703 | 9% | 86% | 5% |
+| dswp | 1,500 | 0.662 | 0% | 75% | 24% |
+| dori_orca_full | 5,215 | 0.640 | 0% | 66% | 34% |
+| orcasound | 989 | 0.640 | 0% | 64% | 36% |
+| right_whale | 27,932 | 0.590 | 0% | 25% | 75% |
+| **Total** | **44,609** | **0.616** | **1%** | **42%** | **57%** |
+
+Quality histograms are generated in `data/quality_histograms/`.
 
 ## Quick Start
 
@@ -188,6 +206,15 @@ python3 scripts/train.py configs/audio_small_baleen.yaml
 python3 scripts/train.py configs/audio_tiny_all_4cb.yaml
 python3 scripts/train.py configs/audio_small_baleen_4cb.yaml
 
+# === Track 2: Audio (quality-filtered A+B) ===
+# First grade all audio segments:
+python3 scripts/grade_audio_quality.py
+# Tokenize only A+B quality segments:
+python3 scripts/tokenize_all_audio.py --n-codebooks 4 \
+    --quality-csv data/audio_quality_grades.csv --min-grade B
+# Train:
+python3 scripts/train.py configs/audio_small_all_4cb_ab.yaml
+
 # Or run all 1CB models sequentially:
 bash scripts/train_all.sh
 ```
@@ -226,13 +253,13 @@ python3 scripts/evaluate.py runs/symbolic_tiny_dialogue/best_model.pt --dataset-
 | [Watkins](https://cis.whoi.edu/science/B/whalesounds/) | 32 species | 1,697 | ~5 hrs | varies | ~1,700 |
 | [Earth Species Orcas](https://huggingface.co/datasets/earthspecies/orcas) | Orca | 595 + 1 | ~35 min | 44.1 kHz | ~600 |
 | [Orcasound](https://www.orcasound.net/data/) | Sperm whale, Orca | 13 | ~211 min | varies | ~2,500 |
-| [MBARI Pacific Sound](https://registry.opendata.aws/pacific-sound/) | Various (hydrophone) | 4 | 40 min | 16 kHz | ~200 |
-| [DORI-Orcasound](https://huggingface.co/datasets/DORI-SRKW/DORI-Orcasound) | Orca (SRKW) | 1,585 | ~26 hrs | varies | ~4,200 |
+| [MBARI Pacific Sound](https://registry.opendata.aws/pacific-sound/) | Various (hydrophone) | 23 | 3.8 hrs | 16 kHz | ~200 |
+| [DORI-Orcasound](https://huggingface.co/datasets/DORI-SRKW/DORI-Orcasound) | Orca (SRKW) | 1,585 | ~26 hrs | 44.1 kHz | ~5,200 |
 | [Humpback Songs (Tsujii)](https://zenodo.org/records/14862938) | Humpback whale | 6 | 60 min | 44.1 kHz | ~700 |
 | [Right Whale Upcalls](https://www.kaggle.com/c/whale-detection-challenge) | Right whale | 12,000 | ~100 hrs | 2 kHz | ~24,000 |
 | [KW Prince Edward Islands](https://zenodo.org/records/7712582) | Killer whale | 1 | 14 min | 96 kHz | ~170 |
 
-**Total**: ~39,400 tokenized segments, ~3.2M tokens.
+**Total**: ~44,600 graded segments across 10 sources. ~19,300 pass A+B quality filter.
 
 ### Species Taxonomy
 
@@ -300,6 +327,7 @@ All configs are in `configs/`. Key configs:
 | `audio_small_baleen.yaml` | Audio 1CB | small | Baleen whales | LR 3e-4, batch 16, seq_len 512 |
 | `audio_tiny_all_4cb.yaml` | Audio 4CB | tiny | All species (4CB + concat) | LR 5e-4, batch 32, seq_len 1024, vocab 4099 |
 | `audio_small_baleen_4cb.yaml` | Audio 4CB | small | Baleen whales (4CB + concat) | LR 2e-4, batch 8, seq_len 1024, vocab 4099 |
+| `audio_small_all_4cb_ab.yaml` | Audio 4CB | small | All species, A+B quality filtered | LR 2e-4, batch 8, seq_len 1024, vocab 4099 |
 
 Token-level augmentation (for audio track): random token noise (±1-3), token masking, and time stretching.
 
@@ -317,7 +345,8 @@ marine_mammals_communication/
 │   ├── audio_small_toothed.yaml      # Audio, toothed cetaceans (1CB)
 │   ├── audio_small_baleen.yaml       # Audio, baleen whales (1CB)
 │   ├── audio_tiny_all_4cb.yaml       # Audio, all species (tiny, 4CB + concat)
-│   └── audio_small_baleen_4cb.yaml   # Audio, baleen whales (small, 4CB + concat)
+│   ├── audio_small_baleen_4cb.yaml   # Audio, baleen whales (small, 4CB + concat)
+│   └── audio_small_all_4cb_ab.yaml   # Audio, all species A+B quality (small, 4CB)
 ├── data/
 │   ├── raw/                          # Downloaded datasets (not in git)
 │   │   ├── ceti/                     # CETI annotation CSVs
@@ -326,7 +355,8 @@ marine_mammals_communication/
 │   │   ├── esp_orcas/                # Earth Species Project orca calls
 │   │   ├── orcasound/                # Orcasound hydrophone recordings
 │   │   ├── mbari/                    # MBARI Pacific Sound segments
-│   │   ├── dori_orcasound/           # DORI-Orcasound orca FLAC files
+│   │   ├── dori_orcasound/           # DORI-Orcasound orca (small clips)
+│   │   ├── dori_orcasound_full/     # DORI-Orcasound orca (1,585 FLAC, 26 hrs)
 │   │   ├── humpback_zenodo/          # Humpback whale songs (Tsujii)
 │   │   ├── right_whale/              # Right whale upcalls (Kaggle)
 │   │   └── kw_pei/                   # Killer whale Prince Edward Islands
@@ -336,6 +366,7 @@ marine_mammals_communication/
 │       ├── toothed/                  # Toothed cetacean tokens (1CB)
 │       ├── baleen/                   # Baleen whale tokens (1CB)
 │       ├── all_4cb/                  # All species combined (4CB)
+│       ├── all_4cb_ab/              # All species, A+B quality filtered (4CB)
 │       └── baleen_4cb/               # Baleen whale tokens (4CB)
 ├── models/
 │   └── codec.pth                     # WhAM LAC codec weights (not in git)
@@ -349,7 +380,8 @@ marine_mammals_communication/
 │   ├── audio_small_toothed/          # Audio toothed cetaceans (1CB)
 │   ├── audio_small_baleen/           # Audio baleen whales (1CB)
 │   ├── audio_tiny_all_4cb/           # Audio all-species (tiny, 4CB)
-│   └── audio_small_baleen_4cb/       # Audio baleen whales (small, 4CB)
+│   ├── audio_small_baleen_4cb/       # Audio baleen whales (small, 4CB)
+│   └── audio_small_all_4cb_ab/      # Audio all-species A+B quality (small, 4CB)
 ├── scripts/
 │   ├── download_data.py              # Download CETI + DSWP + codec pointer
 │   ├── download_more_data.py         # Download MBARI + HuggingFace datasets
@@ -359,7 +391,8 @@ marine_mammals_communication/
 │   ├── train.py                      # Training CLI entry point
 │   ├── train_all.sh                  # Train all configs sequentially
 │   ├── evaluate.py                   # Evaluate symbolic models
-│   └── generate_all.py               # Generate audio from all trained models
+│   ├── generate_all.py               # Generate audio from all trained models
+│   └── grade_audio_quality.py        # Grade audio quality (A-F) per segment
 ├── src/
 │   ├── data/
 │   │   ├── symbolic_tokenizer.py     # CETI annotations → tokens
@@ -417,10 +450,20 @@ bash scripts/train_all.sh
 python3 scripts/train.py configs/audio_tiny_all_4cb.yaml
 python3 scripts/train.py configs/audio_small_baleen_4cb.yaml
 
-# 8. Generate audio samples
+# 8. Grade audio quality
+python3 scripts/grade_audio_quality.py
+
+# 9. Tokenize quality-filtered data (A+B grades only)
+python3 scripts/tokenize_all_audio.py --n-codebooks 4 \
+    --quality-csv data/audio_quality_grades.csv --min-grade B
+
+# 10. Train on quality-filtered data
+python3 scripts/train.py configs/audio_small_all_4cb_ab.yaml
+
+# 11. Generate audio samples
 python3 scripts/generate_all.py --n-samples 5 --max-tokens 300
 
-# 9. Evaluate symbolic models
+# 12. Evaluate symbolic models
 python3 scripts/evaluate.py runs/symbolic_tiny_coda/best_model.pt --dataset-type coda
 python3 scripts/evaluate.py runs/symbolic_tiny_dialogue/best_model.pt --dataset-type dialogue
 ```
