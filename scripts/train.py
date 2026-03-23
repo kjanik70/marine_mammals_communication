@@ -19,6 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train marine mammal LLM")
     parser.add_argument("config", type=str, help="Path to YAML config file")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="Initialize model weights from a checkpoint (e.g., runs/.../best_model.pt)")
     args = parser.parse_args()
 
     # Load config
@@ -118,6 +120,12 @@ def main():
     model = CausalTransformer(model_cfg)
     n_params = model.count_parameters()
     print(f"Model: {cfg['model']['preset']} ({n_params:,} parameters)")
+
+    if args.init_from:
+        print(f"Initializing weights from {args.init_from}")
+        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"  Loaded checkpoint (step {ckpt.get('step', '?')}, val_loss {ckpt.get('val_loss', '?')})")
 
     # Training config
     train_cfg = TrainConfig(
