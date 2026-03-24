@@ -108,12 +108,14 @@ def run_all(device="cuda"):
         "all_4cb_ab": "runs/audio_small_all_4cb_ab/best_model.pt",
         "denoised_4cb": "runs/audio_small_denoised_4cb/best_model.pt",
         "clean_combined_4cb": "runs/audio_small_clean_combined_4cb/best_model.pt",
+        "clean_combined_denoised_4cb": "runs/audio_small_clean_combined_denoised_4cb/best_model.pt",
     }
 
     datasets = {
         "all_4cb_ab": "data/tokenized/all_4cb_ab",
         "denoised_4cb": "data/tokenized/denoised_4cb",
         "sanctsound_4cb": "data/tokenized/sanctsound_4cb",
+        "sanctsound_denoised_4cb": "data/tokenized/sanctsound_denoised_4cb",
     }
 
     # Verify all paths exist

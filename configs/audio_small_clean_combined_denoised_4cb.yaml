@@ -1,0 +1,33 @@
+# Audio: Small model on clean combined data, ALL sources denoised
+# denoised long-chunks (7 sources) + dori_orca A+B (2 sources) + SanctSound HI01 (denoised)
+# SanctSound denoised per-chunk: bandpass → segment → normalize → spectral gating → loudness norm
+model:
+  preset: small
+  vocab_size: 4099    # 4*1024 + 2 (PAD+offset) + 1 (SEP)
+  max_seq_len: 1024
+  dropout: 0.15
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/clean_combined_denoised_4cb
+  max_seq_len: 1024
+  n_codebooks: 4
+  concat: true
+  sep_token: 4098     # N_CODEBOOKS * 1024 + 2
+  augment: true
+  token_noise_prob: 0.05
+  token_mask_prob: 0.02
+  time_stretch_prob: 0.3
+
+training:
+  learning_rate: 2.0e-4
+  weight_decay: 0.15
+  batch_size: 8
+  num_epochs: 200
+  warmup_steps: 400
+  min_lr_ratio: 0.01
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 500
+  patience: 30
+  output_dir: runs/audio_small_clean_combined_denoised_4cb
