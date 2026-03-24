@@ -152,9 +152,11 @@ class Trainer:
                     else:
                         self.config.patience_counter += 1
 
+                    # Flush logs to disk after each eval
+                    self._write_logs(log_entries)
+
                     if self.config.patience_counter >= self.config.patience:
                         print(f"Early stopping at step {step}")
-                        self._write_logs(log_entries)
                         return
 
                     self.model.train()
