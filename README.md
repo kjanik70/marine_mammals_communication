@@ -285,6 +285,17 @@ The pipeline per file:
 | HI04 | 01, 02, 03 | 981 | 240,369 | |
 | **Total** | | **~2,822** | **497,444** | **~3.2B tokens** |
 
+**Token-level quality grading** (sampled 2,000 files per deployment, 17,245 total):
+
+| Station | Files | Avg Score | A% | B% | C% | D+F% |
+|---------|------:|----------:|---:|---:|---:|-----:|
+| HI01 | 154,449 | 0.709 | 4.5 | 94.9 | 0.5 | 0.0 |
+| HI03 | 95,689 | 0.719 | 3.4 | 96.1 | 0.5 | 0.0 |
+| HI04 | 240,369 | 0.720 | 4.5 | 95.1 | 0.4 | 0.0 |
+| HI05 | 6,937 | 0.713 | 0.5 | 99.5 | 0.0 | 0.0 |
+
+Grades are computed from token-level metrics (CB0 entropy, unique token ratio, consecutive repeat ratio, codebook range usage). 95–99.5% of chunks score grade B across all stations — the whale-band CV filter effectively rejects ambient noise, leaving only vocalization-rich content. Zero D/F grades.
+
 ### 5. Train models
 
 ```bash
