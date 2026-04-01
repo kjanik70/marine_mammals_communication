@@ -216,7 +216,7 @@ python3 scripts/tokenize_denoised_audio.py --codec-path models/codec.pth --n-cod
     --quality-csv data/audio_quality_grades.csv --min-quality-score 0.6
 ```
 
-#### Pipeline C: SanctSound (passive acoustic monitoring)
+#### Pipeline C: SanctSound pilot (passive acoustic monitoring)
 
 For continuous hydrophone recordings. These have very low SNR — spectral gating removes faint whale calls, so we use bandpass-only with per-chunk peak normalization:
 
@@ -237,6 +237,53 @@ The pipeline per file:
 3. Segment into ≤30s chunks (adaptive silence detection)
 4. Per-chunk peak normalization to 0.9
 5. Tokenize with LAC codec (4 codebooks)
+
+#### Pipeline D: SanctSound Hawaii humpback (large-scale, detection-guided)
+
+Builds on Pipeline C with three key improvements: (1) skips the 5-second test tone at the start of each FLAC, (2) uses NOAA detection annotations to process only high-detection hours (>80% humpback), and (3) applies a whale-band variability filter to keep only chunks with actual vocalizations. Processes one deployment at a time, streaming FLACs from GCS and deleting them after tokenization to manage disk space.
+
+```bash
+export PYTHONPATH=.
+
+# Process all Hawaii stations (hi01, hi03, hi04, hi05)
+python3 scripts/process_sanctsound_humpback.py
+
+# Process a specific station and deployment
+python3 scripts/process_sanctsound_humpback.py --station hi04 --deployment 2
+
+# Dry run (list qualifying FLACs without downloading)
+python3 scripts/process_sanctsound_humpback.py --station hi05 --dry-run
+# → data/tokenized/sanctsound_humpback_4cb/
+```
+
+The pipeline per file:
+1. Load FLAC, convert to mono, resample to 44,100 Hz
+2. Skip first 5 seconds (test tone present in all SanctSound recordings)
+3. Bandpass filter 80 Hz – 20 kHz
+4. Segment into ≤30s chunks, remove silence >4s
+5. Per-chunk peak normalization to 0.9
+6. **Whale-band variability filter**: compute coefficient of variation of RMS energy in 200–4000 Hz band (0.5s frames). Keep chunks with CV > 0.8 (whale songs ~1.5–3.5, ocean noise ~0.3–0.5)
+7. Loudness normalization to -20 LUFS (**no spectral gating** — it removes faint whale calls)
+8. Tokenize with LAC codec (4 codebooks)
+
+**Key lessons learned from SanctSound processing:**
+- **No spectral gating**: Standard noise reduction (spectral gating) destroys faint whale calls in low-SNR hydrophone data. Bandpass + loudness normalization preserves them.
+- **Per-chunk normalization**: Hydrophone recordings have sparse loud transients (boat passes, snapping shrimp) that suppress the entire file if normalized globally. Per-chunk normalization ensures each 30s chunk uses the full dynamic range.
+- **Test tone**: Every SanctSound FLAC begins with a ~5s calibration tone that must be skipped.
+- **Detection-guided selection**: Processing all hours wastes compute on empty ocean. Using NOAA's hourly detection annotations (>80% humpback proportion) focuses on hours with confirmed whale presence.
+- **Whale-band variability filter**: Even within high-detection hours, many 30s chunks contain only ambient noise. The CV filter provides a cheap, effective way to keep only chunks with actual vocalizations — no ML detector needed.
+- **Stream-and-delete**: Each FLAC is ~5.4 GB (96 kHz, 15 min). Downloading all at once is infeasible. Process one deployment at a time, delete FLACs after tokenization.
+- **Done-file tracking**: `.done_{station}_{dep}.txt` files track which FLACs have been processed, enabling clean restarts without duplicate token creation.
+
+**Stations processed** (4 stations, 10 deployments):
+
+| Station | Deployments | FLACs | Token files | Notes |
+|---------|------------|-------|-------------|-------|
+| HI05 | 01 | ~135 | 6,937 | Smallest, used for pipeline validation |
+| HI01 | 01, 02, 03 | 1,144 | 154,449 | |
+| HI03 | 01, 03 | 562 | 95,689 | 02 has 0 qualifying FLACs |
+| HI04 | 01, 02, 03 | 981 | 240,369 | |
+| **Total** | | **~2,822** | **497,444** | **~3.2B tokens** |
 
 ### 5. Train models
 
@@ -278,6 +325,11 @@ python3 scripts/train.py configs/audio_small_all_4cb_ab.yaml
 # === Track 2: Audio (denoised long-chunk) ===
 # Uses Pipeline B output (data/tokenized/denoised_4cb/)
 python3 scripts/train.py configs/audio_small_denoised_4cb.yaml
+
+# === Track 2: Audio (SanctSound humpback, Pipeline D) ===
+# Uses data/tokenized/sanctsound_humpback_4cb/ (~3.2B tokens, 497K files)
+python3 scripts/train.py configs/audio_medium_sanctsound_humpback_4cb.yaml
+python3 scripts/train.py configs/audio_large_sanctsound_humpback_4cb.yaml
 
 # Or run all 1CB models sequentially:
 bash scripts/train_all.sh
@@ -327,15 +379,19 @@ python3 scripts/evaluate.py runs/symbolic_tiny_dialogue/best_model.pt --dataset-
 
 ### NOAA SanctSound (Passive Acoustic Monitoring)
 
-[SanctSound](https://sanctsound.ioos.us/) is a NOAA program that deployed hydrophones across U.S. National Marine Sanctuaries. The data is publicly available on Google Cloud Storage (anonymous access).
+[SanctSound](https://sanctsound.ioos.us/) is a NOAA program that deployed hydrophones across U.S. National Marine Sanctuaries. The data is publicly available on Google Cloud Storage (`noaa-passive-bioacoustic` bucket, anonymous access).
 
-| Station | Location | Species | Files (pilot) | Duration | Sample Rate |
-|---------|----------|---------|---------------|----------|-------------|
-| HI01–HI06 | Hawaii | Humpback whale | 100 (HI01) | 25 hrs | 96 kHz |
-| OC01–OC04 | Olympic Coast | Orca, humpback | — | — | 48–96 kHz |
-| PM01–PM08 | Pacific (various) | Orca, humpback, dolphin | — | — | 48–96 kHz |
+Processed via Pipeline D (detection-guided, whale-band CV filter):
 
-The full dataset contains ~25,000 FLAC files across 31 stations. Currently we have a pilot of 100 files from HI01 (Hawaii humpback), producing 3,553 chunks and 20.7M tokens.
+| Station | Location | Deployments | FLACs processed | Token files | Tokens |
+|---------|----------|-------------|-----------------|-------------|--------|
+| HI01 | Hilo, Hawaii | 01, 02, 03 | 1,144 | 154,449 | ~1.0B |
+| HI03 | Maui, Hawaii | 01, 03 | 562 | 95,689 | ~610M |
+| HI04 | Hawaii (west) | 01, 02, 03 | 981 | 240,369 | ~1.5B |
+| HI05 | Kona, Hawaii | 01 | ~135 | 6,937 | ~44M |
+| **Total** | | **10** | **~2,822** | **497,444** | **~3.2B** |
+
+The full SanctSound dataset contains ~25,000 FLAC files across 31 stations. Future expansion targets: OC02 (Olympic Coast orcas), PM stations (Pacific humpback/orca).
 
 **Species frequency compatibility**: Humpback (80–8,000 Hz), orca (1–25 kHz), and dolphins (2–150 kHz) work well with the LAC codec's 400 Hz+ range. Blue whale (10–100 Hz) and fin whale (15–30 Hz) are below the bandpass and cannot be used.
 
@@ -362,7 +418,8 @@ Three processing pipelines handle different data types:
 
 - **Pipeline A** (raw tokenization): Segments short clips (0.3–5s) directly. For pre-segmented datasets.
 - **Pipeline B** (denoised long-chunk): Denoises with bandpass + spectral gating, segments into 30s chunks preserving natural pauses. For existing datasets.
-- **Pipeline C** (SanctSound): Bandpass-only (no spectral gating — it removes faint whale calls on low-SNR hydrophone data), per-chunk peak normalization, 30s chunks. For passive acoustic monitoring recordings.
+- **Pipeline C** (SanctSound pilot): Bandpass-only (no spectral gating — it removes faint whale calls on low-SNR hydrophone data), per-chunk peak normalization, 30s chunks. For passive acoustic monitoring recordings.
+- **Pipeline D** (SanctSound large-scale): Detection-guided selection (NOAA annotations, >80% humpback), whale-band variability filter (CV > 0.8), test-tone skip, stream-and-delete FLAC handling. Produces ~3.2B tokens from 4 Hawaii stations.
 
 ### Multi-Codebook (4CB) Tokenization
 
@@ -411,6 +468,8 @@ All configs are in `configs/`. Key configs:
 | `audio_small_baleen_4cb.yaml` | Audio 4CB | small | Baleen whales (4CB + concat) | LR 2e-4, batch 8, seq_len 1024, vocab 4099 |
 | `audio_small_all_4cb_ab.yaml` | Audio 4CB | small | All species, A+B quality filtered | LR 2e-4, batch 8, seq_len 1024, vocab 4099 |
 | `audio_small_denoised_4cb.yaml` | Audio 4CB | small | Denoised long-chunk (30s) | LR 2e-4, batch 8, seq_len 1024, vocab 4099 |
+| `audio_medium_sanctsound_humpback_4cb.yaml` | Audio 4CB | medium | SanctSound humpback (~3.2B tokens) | LR 2e-4, batch 2, grad_accum 4, seq_len 4096, vocab 4099 |
+| `audio_large_sanctsound_humpback_4cb.yaml` | Audio 4CB | large | SanctSound humpback (~3.2B tokens) | LR 1.5e-4, batch 8, seq_len 4096, vocab 4099 |
 
 Token-level augmentation (for audio track): random token noise (±1-3), token masking, and time stretching.
 
@@ -430,7 +489,9 @@ marine_mammals_communication/
 │   ├── audio_tiny_all_4cb.yaml       # Audio, all species (tiny, 4CB + concat)
 │   ├── audio_small_baleen_4cb.yaml   # Audio, baleen whales (small, 4CB + concat)
 │   ├── audio_small_all_4cb_ab.yaml   # Audio, all species A+B quality (small, 4CB)
-│   └── audio_small_denoised_4cb.yaml # Audio, denoised long-chunk (small, 4CB)
+│   ├── audio_small_denoised_4cb.yaml # Audio, denoised long-chunk (small, 4CB)
+│   ├── audio_medium_sanctsound_humpback_4cb.yaml # SanctSound humpback (medium, 4CB)
+│   └── audio_large_sanctsound_humpback_4cb.yaml  # SanctSound humpback (large, 4CB)
 ├── data/
 │   ├── raw/                          # Downloaded datasets (not in git)
 │   │   ├── ceti/                     # CETI annotation CSVs
@@ -460,7 +521,8 @@ marine_mammals_communication/
 │       ├── all_4cb_ab/              # All species, A+B quality filtered (4CB)
 │       ├── baleen_4cb/               # Baleen whale tokens (4CB)
 │       ├── denoised_4cb/             # Denoised long-chunk tokens (4CB)
-│       └── sanctsound_4cb/           # SanctSound tokens (4CB)
+│       ├── sanctsound_4cb/           # SanctSound pilot tokens (4CB)
+│       └── sanctsound_humpback_4cb/ # SanctSound humpback tokens (4CB, ~497K files)
 ├── models/
 │   └── codec.pth                     # WhAM LAC codec weights (not in git)
 ├── runs/                             # Training outputs (not in git)
@@ -475,7 +537,8 @@ marine_mammals_communication/
 │   ├── audio_tiny_all_4cb/           # Audio all-species (tiny, 4CB)
 │   ├── audio_small_baleen_4cb/       # Audio baleen whales (small, 4CB)
 │   ├── audio_small_all_4cb_ab/      # Audio all-species A+B quality (small, 4CB)
-│   └── audio_small_denoised_4cb/    # Audio denoised long-chunk (small, 4CB)
+│   ├── audio_small_denoised_4cb/    # Audio denoised long-chunk (small, 4CB)
+│   └── audio_medium_sanctsound_humpback_4cb/ # SanctSound humpback (medium, 4CB)
 ├── scripts/
 │   ├── download_data.py              # Download CETI + DSWP + codec pointer
 │   ├── download_more_data.py         # Download MBARI + HuggingFace datasets
@@ -491,7 +554,8 @@ marine_mammals_communication/
 │   ├── denoise_medium.py             # Medium denoising functions
 │   ├── tokenize_denoised_audio.py    # Tokenize denoised audio, 30s chunks (Pipeline B)
 │   ├── download_sanctsound.py        # Download SanctSound FLAC files from GCS
-│   └── process_sanctsound.py         # SanctSound: bandpass + tokenize (Pipeline C)
+│   ├── process_sanctsound.py         # SanctSound: bandpass + tokenize (Pipeline C)
+│   └── process_sanctsound_humpback.py # SanctSound large-scale humpback (Pipeline D)
 ├── src/
 │   ├── data/
 │   │   ├── symbolic_tokenizer.py     # CETI annotations → tokens
@@ -557,16 +621,21 @@ python3 scripts/tokenize_denoised_audio.py \
     --quality-csv data/audio_quality_grades.csv           # → data/tokenized/denoised_4cb/
 python3 scripts/train.py configs/audio_small_denoised_4cb.yaml
 
-# 8. Pipeline C: SanctSound (passive acoustic monitoring)
+# 8. Pipeline C: SanctSound pilot (passive acoustic monitoring)
 pip install google-cloud-storage
 python3 scripts/download_sanctsound.py --station hi01 --deployment 1
 python3 scripts/process_sanctsound.py --station hi01 --device cuda
 # → data/tokenized/sanctsound_4cb/
 
-# 9. Generate audio samples
+# 9. Pipeline D: SanctSound large-scale humpback (~3.2B tokens)
+python3 scripts/process_sanctsound_humpback.py
+# → data/tokenized/sanctsound_humpback_4cb/
+python3 scripts/train.py configs/audio_medium_sanctsound_humpback_4cb.yaml
+
+# 10. Generate audio samples
 python3 scripts/generate_all.py --n-samples 5 --max-tokens 300
 
-# 10. Evaluate symbolic models
+# 11. Evaluate symbolic models
 python3 scripts/evaluate.py runs/symbolic_tiny_coda/best_model.pt --dataset-type coda
 python3 scripts/evaluate.py runs/symbolic_tiny_dialogue/best_model.pt --dataset-type dialogue
 ```

@@ -1,5 +1,9 @@
 """PyTorch Dataset classes for marine mammal communication training."""
 
+import bisect
+import os
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +19,31 @@ from src.data.dialogue_builder import (
     split_dialogues,
     tokenize_dialogue,
 )
+
+
+def _load_npy(path):
+    """Load a single .npy file. Returns (stem, tokens) or (stem, None) if too short."""
+    tokens = np.load(path)
+    if len(tokens) > 2:
+        return (path.stem, tokens)
+    return (path.stem, None)
+
+
+def _scan_npy(path):
+    """Scan a .npy file header only. Returns (path, stem, n_tokens) or None if too short."""
+    arr = np.load(path, mmap_mode='r')
+    n = arr.shape[0]
+    if n > 2:
+        return (path, path.stem, n)
+    return None
+
+
+@dataclass
+class _ConcatGroup:
+    """Index for a group of concatenated files."""
+    file_entries: list = field(default_factory=list)  # [(Path, n_tokens), ...]
+    cum_offsets: list = field(default_factory=list)    # start position of each file
+    total_length: int = 0
 
 
 class CodaSequenceDataset(Dataset):
@@ -145,8 +174,9 @@ class DialogueDataset(Dataset):
 class AudioTokenDataset(Dataset):
     """Dataset of pre-tokenized audio sequences (Track 2).
 
-    Loads token arrays from disk (produced by the audio tokenizer).
-    Each item is a fixed-length sequence of audio codec tokens.
+    Lazy-loading: builds a lightweight index at init time (~125MB for 500K files),
+    loads individual windows from disk on demand in __getitem__. Scales to billions
+    of tokens without OOM.
 
     Supports data augmentation to reduce overfitting:
     - token_noise_prob: probability of perturbing each token by ±1-3
@@ -183,46 +213,114 @@ class AudioTokenDataset(Dataset):
         else:
             token_dirs = [Path(token_dir)]
 
-        # Load all .npy files, keyed by filename for grouping
-        raw_files = []
+        # Collect all .npy file paths
+        all_paths = []
         for td in token_dirs:
-            for f in sorted(td.glob("*.npy")):
-                tokens = np.load(f)
-                if len(tokens) > 2:
-                    raw_files.append((f.stem, tokens))
+            all_paths.extend(sorted(td.glob("*.npy")))
+
+        # Phase 1: Scan file headers (parallel, no data loaded)
+        n_workers = min(len(all_paths), os.cpu_count() or 4)
+        if n_workers > 1 and len(all_paths) > 100:
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                results = list(pool.map(_scan_npy, all_paths, chunksize=256))
+        else:
+            results = [_scan_npy(f) for f in all_paths]
+
+        scanned = [r for r in results if r is not None]
+
+        # Phase 2: Build index
+        self._groups = []      # concat mode: list of _ConcatGroup
+        self._file_list = []   # non-concat mode: list of (Path, n_tokens)
+        self._windows = []     # list of (source_idx, start, end) tuples
 
         if concat and sep_token is not None:
-            # Group files by source prefix (everything before _NNNNNN)
-            groups = {}
-            for stem, tokens in raw_files:
-                # Extract prefix: "dswp_000001" -> "dswp"
-                parts = stem.rsplit("_", 1)
-                prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else stem
-                groups.setdefault(prefix, []).append(tokens)
-
-            # Concatenate within each group with SEP tokens
-            self.token_sequences = []
-            for prefix in sorted(groups):
-                seqs = groups[prefix]
-                concat_arr = seqs[0]
-                for s in seqs[1:]:
-                    concat_arr = np.concatenate([
-                        concat_arr, np.array([sep_token], dtype=concat_arr.dtype), s
-                    ])
-                self.token_sequences.append(concat_arr)
+            self._build_concat_index(scanned, max_seq_len)
         else:
-            self.token_sequences = [tokens for _, tokens in raw_files]
+            self._build_simple_index(scanned, max_seq_len)
 
-        # Create sliding windows for sequences longer than max_seq_len
-        self.windows = []
-        for tokens in self.token_sequences:
-            if len(tokens) <= max_seq_len + 1:
-                self.windows.append(tokens)
+    def _build_concat_index(self, scanned, max_seq_len):
+        """Build window index for concat mode (group by prefix, SEP between files)."""
+        # Group files by source prefix (everything before _NNNNNN)
+        groups = {}
+        for path, stem, n_tokens in scanned:
+            parts = stem.rsplit("_", 1)
+            prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else stem
+            groups.setdefault(prefix, []).append((path, n_tokens))
+
+        for prefix in sorted(groups):
+            files = groups[prefix]
+            group = _ConcatGroup()
+            pos = 0
+            for i, (path, n_tokens) in enumerate(files):
+                group.file_entries.append((path, n_tokens))
+                group.cum_offsets.append(pos)
+                pos += n_tokens
+                if i < len(files) - 1:
+                    pos += 1  # SEP token between files
+            group.total_length = pos
+
+            group_idx = len(self._groups)
+            self._groups.append(group)
+
+            # Generate sliding windows
+            total = group.total_length
+            if total <= max_seq_len + 1:
+                self._windows.append((group_idx, 0, total))
             else:
                 stride = max_seq_len // 2
-                for start in range(0, len(tokens) - max_seq_len, stride):
-                    self.windows.append(tokens[start: start + max_seq_len + 1])
-                self.windows.append(tokens[-(max_seq_len + 1):])
+                for start in range(0, total - max_seq_len, stride):
+                    self._windows.append((group_idx, start, start + max_seq_len + 1))
+                self._windows.append((group_idx, total - max_seq_len - 1, total))
+
+    def _build_simple_index(self, scanned, max_seq_len):
+        """Build window index for non-concat mode (each file independent)."""
+        for path, stem, n_tokens in scanned:
+            file_idx = len(self._file_list)
+            self._file_list.append((path, n_tokens))
+
+            if n_tokens <= max_seq_len + 1:
+                self._windows.append((file_idx, 0, n_tokens))
+            else:
+                stride = max_seq_len // 2
+                for start in range(0, n_tokens - max_seq_len, stride):
+                    self._windows.append((file_idx, start, start + max_seq_len + 1))
+                self._windows.append((file_idx, n_tokens - max_seq_len - 1, n_tokens))
+
+    def _load_concat_window(self, group_idx, start, end):
+        """Load tokens for a window that spans concatenated files."""
+        group = self._groups[group_idx]
+        offsets = group.cum_offsets
+
+        # Binary search to find first and last file in range
+        first = bisect.bisect_right(offsets, start) - 1
+        last = bisect.bisect_right(offsets, end - 1) - 1
+
+        pieces = []
+        for fi in range(first, last + 1):
+            path, flen = group.file_entries[fi]
+            file_start = offsets[fi]
+            file_end = file_start + flen
+
+            # SEP token between previous file and this one
+            if fi > first:
+                sep_pos = offsets[fi] - 1  # SEP sits just before this file
+                if start <= sep_pos < end:
+                    pieces.append(np.array([self.sep_token], dtype=np.int16))
+
+            # Slice of this file that falls within [start, end)
+            lo = max(0, start - file_start)
+            hi = min(flen, end - file_start)
+            if lo < hi:
+                arr = np.load(path)
+                pieces.append(arr[lo:hi])
+
+        return np.concatenate(pieces) if pieces else np.array([], dtype=np.int16)
+
+    def _load_simple_window(self, file_idx, start, end):
+        """Load tokens for a window from a single file."""
+        path, _ = self._file_list[file_idx]
+        arr = np.load(path)
+        return arr[start:end]
 
     def _augment_tokens(self, tokens: np.ndarray) -> np.ndarray:
         """Apply token-level data augmentation."""
@@ -257,10 +355,16 @@ class AudioTokenDataset(Dataset):
         return tokens
 
     def __len__(self) -> int:
-        return len(self.windows)
+        return len(self._windows)
 
     def __getitem__(self, idx: int) -> dict:
-        tokens = self.windows[idx]
+        source_idx, start, end = self._windows[idx]
+
+        # Load tokens from disk on demand
+        if self.concat and self.sep_token is not None:
+            tokens = self._load_concat_window(source_idx, start, end)
+        else:
+            tokens = self._load_simple_window(source_idx, start, end)
 
         # Apply augmentation during training
         if self.augment:

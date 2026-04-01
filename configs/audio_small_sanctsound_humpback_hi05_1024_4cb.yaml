@@ -1,0 +1,34 @@
+# Audio: Small model on SanctSound HI05 humpback whale data
+# 1024 context length for comparison with previous training runs
+# Pipeline B: bandpass → normalize → loudness norm (no spectral gating)
+# Whale-band variability filter (CV > 0.8)
+model:
+  preset: small
+  vocab_size: 4099    # 4*1024 + 2 (PAD+offset) + 1 (SEP)
+  max_seq_len: 1024
+  dropout: 0.15
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/sanctsound_humpback_hi05_4cb
+  max_seq_len: 1024
+  n_codebooks: 4
+  concat: true
+  sep_token: 4098
+  augment: true
+  token_noise_prob: 0.05
+  token_mask_prob: 0.02
+  time_stretch_prob: 0.3
+
+training:
+  learning_rate: 2.0e-4
+  weight_decay: 0.15
+  batch_size: 8
+  num_epochs: 200
+  warmup_steps: 400
+  min_lr_ratio: 0.01
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 500
+  patience: 30
+  output_dir: runs/audio_small_sanctsound_humpback_hi05_1024_4cb

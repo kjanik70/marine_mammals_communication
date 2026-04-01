@@ -10,6 +10,10 @@ build/
 data/raw/
 data/processed/
 data/tokenized/
+data/denoised/
+data/sanctsound/
+data/hi05_spot_check/
+data/quality_histograms/
 
 # Model weights
 models/

@@ -109,8 +109,14 @@ def main():
         print(f"Vocab size: {vocab_size}")
 
     batch_size = cfg["training"]["batch_size"]
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    loader_kwargs = dict(
+        pin_memory=True,
+        num_workers=4,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     # Create model
     print("\n=== Creating model ===")
@@ -132,8 +138,10 @@ def main():
         learning_rate=cfg["training"]["learning_rate"],
         weight_decay=cfg["training"]["weight_decay"],
         batch_size=batch_size,
+        grad_accumulation_steps=cfg["training"].get("grad_accumulation_steps", 1),
         num_epochs=cfg["training"]["num_epochs"],
         warmup_steps=cfg["training"]["warmup_steps"],
+        min_lr_ratio=cfg["training"].get("min_lr_ratio", 0.1),
         log_interval=cfg["training"]["log_interval"],
         eval_interval=cfg["training"]["eval_interval"],
         save_interval=cfg["training"]["save_interval"],
