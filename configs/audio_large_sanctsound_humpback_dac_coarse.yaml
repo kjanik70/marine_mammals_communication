@@ -17,6 +17,8 @@ data:
   concat: true
   sep_token: 1026     # 1024 + 2 (after +1 offset)
   augment: false
+  score_file: data/tokenized/sanctsound_humpback_dac/chunk_scores.csv
+  min_detector_score: 0.5
 
 training:
   learning_rate: 1.5e-4

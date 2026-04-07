@@ -182,6 +182,18 @@ class DialogueDataset(Dataset):
         }
 
 
+def _load_accepted_files(score_file, min_score):
+    """Return set of .npy filenames with detector_score >= min_score."""
+    import csv
+    accepted = set()
+    with open(score_file) as f:
+        for row in csv.DictReader(f):
+            ds = row.get('detector_score', '')
+            if ds == '' or float(ds) >= min_score:
+                accepted.add(row['npy_file'])
+    return accepted
+
+
 class AudioTokenDataset(Dataset):
     """Dataset of pre-tokenized audio sequences (Track 2).
 
@@ -208,6 +220,8 @@ class AudioTokenDataset(Dataset):
         concat: bool = False,
         sep_token: int | None = None,
         codebook_index: int | None = None,
+        score_file: str | Path | None = None,
+        min_detector_score: float | None = None,
     ):
         self.max_seq_len = max_seq_len
         self.pad_token = pad_token
@@ -230,6 +244,14 @@ class AudioTokenDataset(Dataset):
         all_paths = []
         for td in token_dirs:
             all_paths.extend(sorted(td.glob("*.npy")))
+
+        # Filter by detector score if score_file provided
+        if score_file and min_detector_score is not None:
+            accepted = _load_accepted_files(score_file, min_detector_score)
+            n_before = len(all_paths)
+            all_paths = [p for p in all_paths if p.name in accepted]
+            print(f"Score filter: {len(all_paths)}/{n_before} files with "
+                  f"detector_score >= {min_detector_score}")
 
         # Phase 1: Scan file headers (parallel, no data loaded)
         n_workers = min(len(all_paths), os.cpu_count() or 4)

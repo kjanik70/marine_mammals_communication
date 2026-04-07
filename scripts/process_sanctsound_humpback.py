@@ -287,6 +287,35 @@ def score_chunk_whale(chunk, sr, score_fn, target_sr=10000):
     return float(tf.reduce_mean(scores).numpy())
 
 
+def score_chunks_parallel(chunks, sr, score_fn, n_workers=8):
+    """Score multiple chunks for humpback presence in parallel using threads.
+
+    TF releases the GIL during inference, so threads give real parallelism.
+    With 8 workers: ~12s per FLAC instead of ~90s serial.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _score_one(chunk):
+        return score_chunk_whale(chunk, sr, score_fn)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        scores = list(pool.map(_score_one, chunks))
+    return scores
+
+
+def append_score_rows(score_path, rows):
+    """Append score rows to chunk_scores.csv (creates with header if new)."""
+    import csv
+    write_header = not score_path.exists()
+    with open(score_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'npy_file', 'flac_name', 'chunk_idx_in_flac',
+            'whale_cv', 'energy_ratio', 'whale_rms', 'detector_score'])
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
 # --- Detection data functions ---
 
 def load_detection_hours(det_dir, station, min_detection=0.8):
@@ -422,9 +451,10 @@ def preprocess_flac_cpu(flac_path, target_sr=44100, skip_seconds=5.0,
     chunks = segment_audio_long(audio, sr)
 
     ready_chunks = []
+    chunk_scores = []
     n_filtered = 0
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         # Peak normalize
         peak = np.max(np.abs(chunk))
         if peak > 0:
@@ -437,23 +467,26 @@ def preprocess_flac_cpu(flac_path, target_sr=44100, skip_seconds=5.0,
             n_filtered += 1
             continue
 
-        # Spectrogram energy ratio filter
-        if energy_ratio_threshold > 0:
-            er = whale_energy_ratio(chunk, sr)
-            if er < energy_ratio_threshold:
-                n_filtered += 1
-                continue
+        # Always compute all heuristic scores for the CSV
+        er = whale_energy_ratio(chunk, sr)
+        if energy_ratio_threshold > 0 and er < energy_ratio_threshold:
+            n_filtered += 1
+            continue
 
-        # Minimum whale-band energy filter
-        if min_whale_rms > 0:
-            wb_rms = whale_band_rms(chunk, sr)
-            if wb_rms < min_whale_rms:
-                n_filtered += 1
-                continue
+        wb_rms = whale_band_rms(chunk, sr)
+        if min_whale_rms > 0 and wb_rms < min_whale_rms:
+            n_filtered += 1
+            continue
 
         # Loudness normalize (Pipeline B — no spectral gating)
         chunk = loudness_normalize(chunk, sr)
         ready_chunks.append(chunk)
+        chunk_scores.append({
+            'chunk_idx_in_flac': i,
+            'whale_cv': round(cv, 4),
+            'energy_ratio': round(er, 4),
+            'whale_rms': round(wb_rms, 6),
+        })
 
     stats = {
         "file_duration": file_duration,
@@ -461,7 +494,7 @@ def preprocess_flac_cpu(flac_path, target_sr=44100, skip_seconds=5.0,
         "n_chunks_filtered": n_filtered,
         "n_chunks_kept": len(ready_chunks),
     }
-    return ready_chunks, stats
+    return ready_chunks, chunk_scores, stats
 
 
 def _download_and_preprocess(args):
@@ -509,7 +542,7 @@ def process_flac_file(flac_path, tokenizer, target_sr=44100,
     """
     import torch
 
-    ready_chunks, stats = preprocess_flac_cpu(
+    ready_chunks, _chunk_scores, stats = preprocess_flac_cpu(
         flac_path, target_sr=target_sr,
         skip_seconds=skip_seconds, whale_cv_threshold=whale_cv_threshold,
     )
@@ -535,14 +568,14 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
                        tokenizer, whale_cv_threshold=0.8,
                        energy_ratio_threshold=0.0, min_whale_rms=0.0,
                        detector=None, detector_threshold=0.5,
+                       detector_workers=8,
                        min_detection=0.8, tmp_dir=None, dry_run=False,
                        max_files=None, n_workers=None,
                        save_2d=False):
     """Download, process, and tokenize a single deployment.
 
-    Two-pass filtering:
-    - Pass 1 (heuristic): CV + energy ratio + min RMS (in preprocess_flac_cpu)
-    - Pass 2 (detector): Google humpback detector on survivors (optional)
+    Tokenizes ALL chunks that pass heuristic filters (Pass 1). Detector scores
+    are saved to chunk_scores.csv for filtering at training time.
 
     Supports saving as 2D (n_codebooks, T) arrays for hierarchical models.
     """
@@ -620,11 +653,15 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
         "file_duration": 0,
         "n_chunks_total": 0,
         "n_chunks_filtered": 0,
-        "n_chunks_kept": 0,
+        "n_chunks_tokenized": 0,
+        "n_chunks_above_threshold": 0,
         "n_tokens": 0,
     }
 
-    # Serial processing: download → preprocess → tokenize → delete
+    # Score CSV for persistent detector scores
+    score_path = output_dir / "chunk_scores.csv"
+
+    # Serial processing: download → preprocess → tokenize ALL → score → save scores → delete
     for blob in tqdm(filtered_blobs, desc=f"  {dep_str}"):
         fname = blob.name.split('/')[-1]
 
@@ -643,9 +680,9 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
                 dep_stats["n_flacs_failed"] += 1
                 continue
 
-        # CPU preprocessing + GPU tokenization
+        # CPU preprocessing + GPU tokenization + detector scoring
         try:
-            ready_chunks, stats = preprocess_flac_cpu(
+            ready_chunks, chunk_scores, stats = preprocess_flac_cpu(
                 local_path, whale_cv_threshold=whale_cv_threshold,
                 energy_ratio_threshold=energy_ratio_threshold,
                 min_whale_rms=min_whale_rms,
@@ -656,38 +693,58 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
             dep_stats["n_chunks_total"] += stats["n_chunks_total"]
             dep_stats["n_chunks_filtered"] += stats["n_chunks_filtered"]
 
-            # Pass 2: Google humpback detector (optional)
-            if detector is not None:
-                before_det = len(ready_chunks)
-                ready_chunks = [
-                    c for c in ready_chunks
-                    if score_chunk_whale(c, 44100, detector) >= detector_threshold
-                ]
-                dep_stats["n_chunks_filtered"] += before_det - len(ready_chunks)
-
-            # GPU tokenization
+            # GPU tokenize ALL heuristic-passing chunks (no detector filtering)
+            npy_names = []
             for chunk in ready_chunks:
                 chunk_tensor = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
                 codes, z = tokenizer.encode(chunk_tensor)
 
                 if save_2d:
-                    # Save as 2D (n_codebooks, T) for hierarchical models
                     codes_np = codes[0].cpu().numpy().astype(np.int32)
                     if codes_np.shape[1] > 2:
-                        out_path = output_dir / f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
-                        np.save(out_path, codes_np)
+                        npy_name = f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
+                        np.save(output_dir / npy_name, codes_np)
+                        npy_names.append(npy_name)
                         chunk_idx += 1
-                        dep_stats["n_chunks_kept"] += 1
+                        dep_stats["n_chunks_tokenized"] += 1
                         dep_stats["n_tokens"] += codes_np.shape[1]
+                    else:
+                        npy_names.append(None)
                 else:
-                    # Save as 1D interleaved (legacy format)
                     tokens = tokenizer.codes_to_sequence(codes)
                     if len(tokens) > 2:
-                        out_path = output_dir / f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
-                        np.save(out_path, tokens)
+                        npy_name = f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
+                        np.save(output_dir / npy_name, tokens)
+                        npy_names.append(npy_name)
                         chunk_idx += 1
-                        dep_stats["n_chunks_kept"] += 1
+                        dep_stats["n_chunks_tokenized"] += 1
                         dep_stats["n_tokens"] += len(tokens)
+                    else:
+                        npy_names.append(None)
+
+            # Parallel detector scoring on CPU threads
+            if detector is not None and ready_chunks:
+                det_scores = score_chunks_parallel(
+                    ready_chunks, 44100, detector, n_workers=detector_workers)
+            else:
+                det_scores = [None] * len(ready_chunks)
+
+            # Save scores to CSV
+            score_rows = []
+            for npy_name, scores, det_score in zip(npy_names, chunk_scores, det_scores):
+                if npy_name is None:
+                    continue
+                row = {
+                    'npy_file': npy_name,
+                    'flac_name': fname,
+                    **scores,
+                    'detector_score': round(det_score, 4) if det_score is not None else '',
+                }
+                score_rows.append(row)
+                if det_score is not None and det_score >= detector_threshold:
+                    dep_stats["n_chunks_above_threshold"] += 1
+            if score_rows:
+                append_score_rows(score_path, score_rows)
 
             # Mark FLAC as done (append to done file)
             with open(done_file, 'a') as f:
@@ -706,13 +763,16 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Print summary
-    kept = dep_stats["n_chunks_kept"]
+    tokenized = dep_stats["n_chunks_tokenized"]
     total = dep_stats["n_chunks_total"]
-    pct = 100 * kept / max(total, 1)
+    above = dep_stats["n_chunks_above_threshold"]
+    pct = 100 * tokenized / max(total, 1)
     print(f"\n  {dep_str} summary:")
     print(f"    FLACs processed: {dep_stats['n_flacs_processed']}")
     print(f"    Duration: {dep_stats['file_duration']/3600:.1f} hours")
-    print(f"    Chunks: {kept}/{total} kept ({pct:.0f}%)")
+    print(f"    Chunks tokenized: {tokenized}/{total} ({pct:.0f}%)")
+    if detector is not None:
+        print(f"    Chunks above detector threshold: {above}/{tokenized}")
     print(f"    Tokens: {dep_stats['n_tokens']:,}")
 
     return dep_stats
@@ -747,9 +807,11 @@ def main():
     parser.add_argument("--min-whale-rms", type=float, default=0.0,
                         help="Minimum whale-band RMS energy (0=disabled, try 0.01)")
     parser.add_argument("--use-detector", action="store_true",
-                        help="Use Google humpback detector as Pass 2 filter")
+                        help="Use Google humpback detector to score chunks (scores saved to CSV)")
     parser.add_argument("--detector-threshold", type=float, default=0.5,
-                        help="Minimum detector score to keep a chunk (default: 0.5)")
+                        help="Detector score threshold for summary stats (filtering is at training time)")
+    parser.add_argument("--detector-workers", type=int, default=8,
+                        help="Parallel threads for detector scoring (default: 8)")
     parser.add_argument("--max-files", type=int, default=None,
                         help="Max FLAC files per deployment (for testing)")
     parser.add_argument("--workers", type=int, default=None,
@@ -833,13 +895,15 @@ def main():
                 max_files=args.max_files,
                 n_workers=args.workers,
                 save_2d=args.save_2d,
+                detector_workers=args.detector_workers,
             )
             all_stats.append(stats)
 
     # Print overall summary
     if not args.dry_run and all_stats:
         total_tokens = sum(s.get("n_tokens", 0) for s in all_stats)
-        total_kept = sum(s.get("n_chunks_kept", 0) for s in all_stats)
+        total_tokenized = sum(s.get("n_chunks_tokenized", 0) for s in all_stats)
+        total_above = sum(s.get("n_chunks_above_threshold", 0) for s in all_stats)
         total_chunks = sum(s.get("n_chunks_total", 0) for s in all_stats)
         total_hours = sum(s.get("file_duration", 0) for s in all_stats) / 3600
 
@@ -847,8 +911,11 @@ def main():
         print(f"OVERALL SUMMARY")
         print(f"{'='*60}")
         print(f"Total audio processed: {total_hours:.1f} hours")
-        print(f"Chunks kept: {total_kept}/{total_chunks} "
-              f"({100*total_kept/max(total_chunks,1):.0f}%)")
+        print(f"Chunks tokenized: {total_tokenized}/{total_chunks} "
+              f"({100*total_tokenized/max(total_chunks,1):.0f}%)")
+        if args.use_detector:
+            print(f"Chunks above detector threshold ({args.detector_threshold}): "
+                  f"{total_above}/{total_tokenized}")
         print(f"Total tokens: {total_tokens:,}")
         print(f"Output: {args.output_dir}")
 
@@ -877,7 +944,8 @@ def main():
             "save_2d": args.save_2d,
             "total_hours": round(total_hours, 1),
             "total_tokens": total_tokens,
-            "total_chunks_kept": total_kept,
+            "total_chunks_tokenized": total_tokenized,
+            "total_chunks_above_threshold": total_above if args.use_detector else None,
             "total_chunks_total": total_chunks,
             "deployments": all_stats,
         }

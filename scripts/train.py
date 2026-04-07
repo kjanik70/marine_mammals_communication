@@ -50,6 +50,8 @@ def main():
             concat=concat,
             sep_token=sep_token,
             codebook_index=codebook_index,
+            score_file=cfg["data"].get("score_file", None),
+            min_detector_score=cfg["data"].get("min_detector_score", None),
         )
 
         # Build train set (with augmentation if enabled)
