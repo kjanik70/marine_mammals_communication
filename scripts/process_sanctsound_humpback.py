@@ -242,7 +242,13 @@ def load_humpback_detector():
     Requires: pip install tensorflow-cpu tensorflow-hub
     Model expects 10 kHz mono audio via the 'score' signature.
     Returns the score callable directly.
+
+    Forces TF to CPU-only so it doesn't conflict with PyTorch's GPU usage
+    (TF 2.21 doesn't support Blackwell sm_120 anyway).
     """
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')
+
     import tensorflow_hub as hub
     model = hub.load("https://tfhub.dev/google/humpback_whale/1")
     return model.signatures["score"]
