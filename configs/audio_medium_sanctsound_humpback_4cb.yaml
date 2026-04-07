@@ -23,8 +23,10 @@ data:
 training:
   learning_rate: 2.0e-4
   weight_decay: 0.15
-  batch_size: 2
-  grad_accumulation_steps: 4    # effective batch size = 8
+  batch_size: 4
+  val_batch_size: 16            # larger batch for eval (no gradients = less VRAM)
+  grad_accumulation_steps: 2    # effective batch size = 8
+  max_eval_batches: 500         # cap eval to 500 batches (4000 samples) of 309K val set
   num_epochs: 200
   warmup_steps: 400
   min_lr_ratio: 0.01

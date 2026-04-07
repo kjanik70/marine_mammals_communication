@@ -1,35 +1,34 @@
-# Audio: Large model (273M) on SanctSound Hawaii humpback whale data
+# Audio: Medium model on SanctSound Hawaii humpback whale data
+# Variant: seq_len 2048, no augmentation (3.2B tokens is enough to avoid overfitting)
+# Shorter context = more windows, larger batch, faster convergence
 # Stations: hi01, hi03, hi04, hi05 — high-detection hours only
-# Pipeline B: bandpass → normalize → loudness norm (no spectral gating)
-# Whale-band variability filter (CV > 0.8) to keep only vocalization chunks
-# Gradient checkpointing enabled — bs=16 fits in 11GB on 16GB GPU
 model:
-  preset: large
+  preset: medium
   vocab_size: 4099    # 4*1024 + 2 (PAD+offset) + 1 (SEP)
-  max_seq_len: 4096
+  max_seq_len: 2048
   dropout: 0.15
 
 data:
   dataset_type: audio
   token_dir: data/tokenized/sanctsound_humpback_4cb
-  max_seq_len: 4096
+  max_seq_len: 2048
   n_codebooks: 4
   concat: true
   sep_token: 4098     # N_CODEBOOKS * 1024 + 2
   augment: false
 
 training:
-  learning_rate: 1.5e-4
+  learning_rate: 2.0e-4
   weight_decay: 0.15
-  batch_size: 16
+  batch_size: 8
   val_batch_size: 32            # larger batch for eval (no gradients = less VRAM)
-  grad_accumulation_steps: 1    # effective batch size = 16
+  grad_accumulation_steps: 2    # effective batch size = 16
   max_eval_batches: 500         # cap eval to 500 batches of val set
   num_epochs: 200
   warmup_steps: 400
   min_lr_ratio: 0.01
   log_interval: 50
-  eval_interval: 1000
-  save_interval: 2000
+  eval_interval: 2000
+  save_interval: 4000
   patience: 30
-  output_dir: runs/audio_large_sanctsound_humpback_4cb
+  output_dir: runs/audio_medium_sanctsound_humpback_2048_4cb

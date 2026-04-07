@@ -115,8 +115,9 @@ def main():
         persistent_workers=True,
         prefetch_factor=4,
     )
+    val_batch_size = cfg["training"].get("val_batch_size", batch_size * 4)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False, **loader_kwargs)
 
     # Create model
     print("\n=== Creating model ===")
@@ -146,6 +147,7 @@ def main():
         eval_interval=cfg["training"]["eval_interval"],
         save_interval=cfg["training"]["save_interval"],
         patience=cfg["training"].get("patience", 20),
+        max_eval_batches=cfg["training"].get("max_eval_batches", 0),
         output_dir=cfg["training"]["output_dir"],
     )
 

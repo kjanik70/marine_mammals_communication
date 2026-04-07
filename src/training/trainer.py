@@ -41,6 +41,9 @@ class TrainConfig:
     patience: int = 20           # Stop after N evals without improvement
     patience_counter: int = 0
 
+    # Evaluation
+    max_eval_batches: int = 0    # 0 = full val set; >0 = cap eval to N batches
+
 
 def get_lr(step: int, config: TrainConfig, total_steps: int = 0) -> float:
     """Cosine annealing with warmup."""
@@ -182,6 +185,7 @@ class Trainer:
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
+        max_batches = self.config.max_eval_batches
 
         for batch in self.val_loader:
             input_ids = batch["input_ids"].to(self.device)
@@ -193,6 +197,9 @@ class Trainer:
 
             total_loss += output["loss"].item()
             n_batches += 1
+
+            if max_batches > 0 and n_batches >= max_batches:
+                break
 
         return total_loss / max(n_batches, 1)
 

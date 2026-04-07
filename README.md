@@ -55,6 +55,22 @@ These models use 4 interleaved LAC codebooks for richer audio representation and
 
 > **Note**: Val loss is not directly comparable between 1CB and 4CB models — the 4CB vocabulary is 4x larger (4099 vs 1026), making per-token prediction harder. The real comparison is in generated audio quality: 4CB captures finer spectral detail that 1CB misses.
 
+### Audio Models — SanctSound Humpback (Large-Scale, 4CB)
+
+Trained on ~3.2B tokens from 497K SanctSound Hawaii humpback files (Pipeline D). These models use longer context windows (2048–4096 tokens) and lazy-loading datasets to handle the scale.
+
+| Model | Context | Params | Batch | Val Loss | Perplexity | Notes |
+|-------|---------|--------|-------|----------|------------|-------|
+| Medium 4096 | 4096 | 116M | 4 (eff 8) | 4.6989 | ~110 | Killed after epoch 0 (plateaued) |
+| Medium 2048 | 2048 | 116M | 8 (eff 16) | 4.6432 | ~104 | Killed after epoch 1 (plateaued) |
+| **Large 4096** | **4096** | **273M** | **16** | **4.6080** | **~100** | **76% through epoch 0, still improving** |
+
+Key observations:
+- **Shorter context converges faster**: The 2048 model reached 4.80 val loss in 15K steps vs the 4096 model needing ~200K steps for the same level, thanks to 2x more windows and larger effective batch.
+- **Larger model beats smaller**: The large model (273M) surpassed both medium models (116M) by step ~15K and continued improving.
+- **Gradient checkpointing enables large batches**: The large model fits batch_size=16 at 11GB with gradient checkpointing, vs the medium model needing batch_size=4 at 10.6GB without it.
+- **Prompted generation works**: Feeding 5s of real whale audio as a prompt produces more coherent continuations than unconditional generation from random tokens.
+
 ### Audio Quality Grading
 
 Each raw audio segment is graded A–F based on signal quality metrics (spectral flatness, peak-to-RMS ratio, energy variance, RMS energy). The "A+B" model above uses only segments graded A or B — filtering out noisy/silent segments (mostly right_whale at 2kHz and ambient MBARI hydrophone recordings).
@@ -71,6 +87,39 @@ Each raw audio segment is graded A–F based on signal quality metrics (spectral
 | **Total** | **44,609** | **0.616** | **1%** | **42%** | **57%** |
 
 Quality histograms are generated in `data/quality_histograms/`.
+
+### Codec Reconstruction Quality (LAC vs DAC)
+
+We evaluated roundtrip reconstruction quality (original → encode → decode → compare) to understand how much information the audio tokenization preserves. Tests used 10 files from DSWP, humpback, orcasound, and ESP orcas datasets, preprocessed with the same pipeline used for tokenization (bandpass 80 Hz–20 kHz + peak normalization to 0.9).
+
+**LAC (WhAM weights)** — 44.1 kHz, hop=768, 14 codebooks, ~57 tokens/sec per codebook:
+
+| Codebooks | SC | SNR (dB) | MCD | xcorr | Total tok/s |
+|-----------|--------|----------|------|-------|-------------|
+| 1 | 0.64 | 0.4 | 19.7 | 0.30 | 57 |
+| **4 (current)** | **0.81** | **-2.0** | **48.7** | **0.14** | **230** |
+| 8 | 0.65 | -0.2 | 15.0 | 0.33 | 459 |
+| 14 (all) | 0.54 | -0.1 | 14.2 | 0.40 | 804 |
+
+**DAC (Descript Audio Codec, 44 kHz)** — 44.1 kHz, hop=512, 9 codebooks, ~86 tokens/sec per codebook:
+
+| Codebooks | SC | SNR (dB) | MCD | xcorr | Total tok/s |
+|-----------|--------|----------|------|-------|-------------|
+| 1 | 0.86 | -2.3 | 44.6 | 0.16 | 86 |
+| 4 | 0.85 | -2.4 | 44.1 | 0.19 | 345 |
+| 9 (all) | 0.51 | 0.8 | 14.8 | 0.50 | 775 |
+
+Metrics: SC = Spectral Convergence (lower = better), SNR = Signal-to-Noise Ratio (higher = better), MCD = Mel Cepstral Distortion (lower = better), xcorr = cross-correlation (higher = better).
+
+**Key findings:**
+
+- **LAC 4CB reconstruction is poor** (xcorr=0.14, negative SNR). The first 4 of 14 RVQ codebooks capture only coarse audio structure — fine spectral detail is lost. This is the representation our current models train on.
+- **DAC at full codebooks is significantly better** (xcorr=0.50, positive SNR) at a similar total token rate (775 vs 804 tok/s). DAC's 9 codebooks distribute information more evenly than LAC's 14.
+- **LAC 4CB has a "dead zone"** — quality is actually worse than 1CB, likely because the interleaved codebook tokens create dependencies the model must learn to reconstruct.
+- **Neither codec is great on whale audio**. Even at full codebooks, xcorr peaks at 0.50 (DAC) / 0.40 (LAC). Human speech codecs are optimized for 300 Hz–8 kHz; whale vocalizations span 80 Hz–25 kHz with different spectral characteristics.
+- **Switching to DAC would require re-tokenizing** all 497K files (~3.2B tokens) and retraining. The LAC WhAM weights were specifically trained on whale audio, which may provide advantages not captured by these metrics.
+
+Audio comparison files for listening tests are saved in `runs/codec_comparison_processed/`.
 
 ## Quick Start
 
@@ -350,10 +399,18 @@ bash scripts/train_all.sh
 
 ```bash
 export PYTHONPATH=.
+
+# Unconditional generation (all trained models)
 python3 scripts/generate_all.py --n-samples 5 --max-tokens 300 --temperature 0.9
+
+# Prompted generation (feed real whale audio, model continues)
+python3 scripts/generate_prompted.py \
+    --checkpoint runs/audio_medium_sanctsound_humpback_4cb/best_model.pt \
+    --token-dir data/tokenized/sanctsound_humpback_4cb \
+    --prompt-tokens 1150 --temperature 0.85 --top-k 80
 ```
 
-Generated WAV files are saved to `runs/<model>/generated/`.
+Generated WAV files are saved to `runs/<model>/generated/` (unconditional) and `runs/<model>/prompted/` (prompted).
 
 ### 7. Evaluate symbolic models
 
@@ -549,7 +606,10 @@ marine_mammals_communication/
 │   ├── audio_small_baleen_4cb/       # Audio baleen whales (small, 4CB)
 │   ├── audio_small_all_4cb_ab/      # Audio all-species A+B quality (small, 4CB)
 │   ├── audio_small_denoised_4cb/    # Audio denoised long-chunk (small, 4CB)
-│   └── audio_medium_sanctsound_humpback_4cb/ # SanctSound humpback (medium, 4CB)
+│   ├── audio_medium_sanctsound_humpback_4cb/ # SanctSound humpback (medium, 4CB)
+│   ├── audio_large_sanctsound_humpback_4cb/ # SanctSound humpback (large, 4CB)
+│   ├── codec_quality/                 # Codec reconstruction evaluation output
+│   └── codec_comparison_processed/    # LAC vs DAC comparison audio files
 ├── scripts/
 │   ├── download_data.py              # Download CETI + DSWP + codec pointer
 │   ├── download_more_data.py         # Download MBARI + HuggingFace datasets
@@ -566,7 +626,10 @@ marine_mammals_communication/
 │   ├── tokenize_denoised_audio.py    # Tokenize denoised audio, 30s chunks (Pipeline B)
 │   ├── download_sanctsound.py        # Download SanctSound FLAC files from GCS
 │   ├── process_sanctsound.py         # SanctSound: bandpass + tokenize (Pipeline C)
-│   └── process_sanctsound_humpback.py # SanctSound large-scale humpback (Pipeline D)
+│   ├── process_sanctsound_humpback.py # SanctSound large-scale humpback (Pipeline D)
+│   ├── generate_prompted.py          # Generate continuations from real whale prompts
+│   ├── eval_codec_quality.py         # LAC roundtrip reconstruction quality test
+│   └── eval_codec_comparison.py      # LAC vs DAC codec comparison
 ├── src/
 │   ├── data/
 │   │   ├── symbolic_tokenizer.py     # CETI annotations → tokens
@@ -649,6 +712,10 @@ python3 scripts/generate_all.py --n-samples 5 --max-tokens 300
 # 11. Evaluate symbolic models
 python3 scripts/evaluate.py runs/symbolic_tiny_coda/best_model.pt --dataset-type coda
 python3 scripts/evaluate.py runs/symbolic_tiny_dialogue/best_model.pt --dataset-type dialogue
+
+# 12. Evaluate codec reconstruction quality
+python3 scripts/eval_codec_quality.py --device cpu   # LAC only, various codebook counts
+python3 scripts/eval_codec_comparison.py --device cpu # LAC vs DAC comparison
 ```
 
 ## References
