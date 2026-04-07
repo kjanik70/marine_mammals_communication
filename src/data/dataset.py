@@ -24,15 +24,26 @@ from src.data.dialogue_builder import (
 def _load_npy(path):
     """Load a single .npy file. Returns (stem, tokens) or (stem, None) if too short."""
     tokens = np.load(path)
-    if len(tokens) > 2:
+    if tokens.ndim == 2:
+        # 2D array (n_codebooks, T) — use time dimension for length check
+        if tokens.shape[1] > 2:
+            return (path.stem, tokens)
+    elif len(tokens) > 2:
         return (path.stem, tokens)
     return (path.stem, None)
 
 
 def _scan_npy(path):
-    """Scan a .npy file header only. Returns (path, stem, n_tokens) or None if too short."""
+    """Scan a .npy file header only. Returns (path, stem, n_tokens) or None if too short.
+
+    Handles both 1D (interleaved) and 2D (n_codebooks, T) arrays.
+    For 2D arrays, n_tokens is the time dimension (shape[1]).
+    """
     arr = np.load(path, mmap_mode='r')
-    n = arr.shape[0]
+    if arr.ndim == 2:
+        n = arr.shape[1]  # time dimension
+    else:
+        n = arr.shape[0]
     if n > 2:
         return (path, path.stem, n)
     return None
@@ -196,6 +207,7 @@ class AudioTokenDataset(Dataset):
         time_stretch_prob: float = 0.3,
         concat: bool = False,
         sep_token: int | None = None,
+        codebook_index: int | None = None,
     ):
         self.max_seq_len = max_seq_len
         self.pad_token = pad_token
@@ -206,6 +218,7 @@ class AudioTokenDataset(Dataset):
         self.time_stretch_prob = time_stretch_prob
         self.concat = concat
         self.sep_token = sep_token
+        self.codebook_index = codebook_index
 
         # Support multiple token directories
         if isinstance(token_dir, (list, tuple)):
@@ -286,6 +299,15 @@ class AudioTokenDataset(Dataset):
                     self._windows.append((file_idx, start, start + max_seq_len + 1))
                 self._windows.append((file_idx, n_tokens - max_seq_len - 1, n_tokens))
 
+    def _extract_1d(self, arr):
+        """Extract 1D token sequence from array, handling 2D codebook files."""
+        if arr.ndim == 2 and self.codebook_index is not None:
+            return arr[self.codebook_index, :]
+        elif arr.ndim == 2:
+            # No codebook_index specified — flatten first row as fallback
+            return arr[0, :]
+        return arr
+
     def _load_concat_window(self, group_idx, start, end):
         """Load tokens for a window that spans concatenated files."""
         group = self._groups[group_idx]
@@ -311,7 +333,7 @@ class AudioTokenDataset(Dataset):
             lo = max(0, start - file_start)
             hi = min(flen, end - file_start)
             if lo < hi:
-                arr = np.load(path)
+                arr = self._extract_1d(np.load(path))
                 pieces.append(arr[lo:hi])
 
         return np.concatenate(pieces) if pieces else np.array([], dtype=np.int16)
@@ -319,7 +341,7 @@ class AudioTokenDataset(Dataset):
     def _load_simple_window(self, file_idx, start, end):
         """Load tokens for a window from a single file."""
         path, _ = self._file_list[file_idx]
-        arr = np.load(path)
+        arr = self._extract_1d(np.load(path))
         return arr[start:end]
 
     def _augment_tokens(self, tokens: np.ndarray) -> np.ndarray:

@@ -43,11 +43,13 @@ def main():
         sep_token = cfg["data"].get("sep_token", None)
 
         # Common dataset kwargs
+        codebook_index = cfg["data"].get("codebook_index", None)
         ds_kwargs = dict(
             max_seq_len=cfg["data"].get("max_seq_len", 512),
             vocab_size=vocab_size,
             concat=concat,
             sep_token=sep_token,
+            codebook_index=codebook_index,
         )
 
         # Build train set (with augmentation if enabled)
@@ -84,6 +86,8 @@ def main():
         print(f"Dataset: audio tokens from {token_dir}")
         print(f"Total windows: {n_total} (train: {n_train}, val: {n_val})")
         print(f"Augmentation: {augment}, Concat: {concat}")
+        if codebook_index is not None:
+            print(f"Codebook index: {codebook_index} (extracting single codebook from 2D files)")
         print(f"Vocab size: {vocab_size}")
     else:
         # Symbolic datasets (Track 1)

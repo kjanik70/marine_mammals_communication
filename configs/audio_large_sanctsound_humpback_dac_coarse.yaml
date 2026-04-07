@@ -1,0 +1,35 @@
+# Audio: Large model (273M) on SanctSound Hawaii humpback — DAC coarse (CB0 only)
+# Hierarchical approach: this coarse model predicts DAC codebook 0 autoregressively
+# Captures whale song structure/rhythm/melody at 86.1 tok/s → 30s fits in 4096
+# Upsampler (separate model) later fills in CB1-8 for full spectral detail
+# Two-pass filtered: heuristic (CV + energy ratio + min RMS) + Google humpback detector
+model:
+  preset: large
+  vocab_size: 1027    # 1024 codes + PAD(0) + offset(+1) + SEP(1026)
+  max_seq_len: 4096
+  dropout: 0.15
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/sanctsound_humpback_dac
+  max_seq_len: 4096
+  codebook_index: 0   # extract CB0 from 2D (9, T) .npy files
+  concat: true
+  sep_token: 1026     # 1024 + 2 (after +1 offset)
+  augment: false
+
+training:
+  learning_rate: 1.5e-4
+  weight_decay: 0.15
+  batch_size: 16
+  val_batch_size: 32
+  grad_accumulation_steps: 1
+  max_eval_batches: 500
+  num_epochs: 200
+  warmup_steps: 400
+  min_lr_ratio: 0.01
+  log_interval: 50
+  eval_interval: 1000
+  save_interval: 2000
+  patience: 30
+  output_dir: runs/audio_large_sanctsound_humpback_dac_coarse

@@ -95,6 +95,38 @@ def whale_band_score(chunk, sr):
     return float(np.std(rms) / max(np.mean(rms), 1e-10))
 
 
+def whale_energy_ratio(chunk, sr, whale_low=200, whale_high=4000):
+    """Fraction of spectral energy in whale frequency band.
+
+    Whale songs concentrate 60-90% of energy in 200-4000 Hz.
+    Broadband ocean noise is typically 20-40%.
+
+    Returns:
+        float: Ratio of whale-band energy to total energy (0-1).
+    """
+    S = np.abs(librosa.stft(chunk, n_fft=2048, hop_length=512))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    whale_mask = (freqs >= whale_low) & (freqs <= whale_high)
+    whale_energy = np.sum(S[whale_mask, :] ** 2)
+    total_energy = np.sum(S ** 2) + 1e-10
+    return float(whale_energy / total_energy)
+
+
+def whale_band_rms(chunk, sr, low=200, high=4000):
+    """RMS energy in whale frequency band.
+
+    Rejects near-silence chunks even if CV is high (e.g., a single click
+    in 30s of silence can have high CV but low overall energy).
+
+    Returns:
+        float: RMS energy in whale band.
+    """
+    nyq = sr / 2
+    sos = butter(5, [low / nyq, high / nyq], btype='band', output='sos')
+    whale_band = sosfilt(sos, chunk).astype(np.float32)
+    return float(np.sqrt(np.mean(whale_band ** 2)))
+
+
 def segment_audio_long(audio, sr, max_duration=30.0, min_duration=2.0,
                        max_silence=4.0, replacement_silence=0.5):
     """Segment into ≤30s chunks, removing long silence, keeping short pauses."""
@@ -202,6 +234,53 @@ def segment_audio_long(audio, sr, max_duration=30.0, min_duration=2.0,
     return chunks
 
 
+# --- Whale song detector (Pass 2) ---
+
+def load_humpback_detector():
+    """Load Google's humpback whale detection model from TF Hub.
+
+    Requires: pip install tensorflow-cpu tensorflow-hub
+    Model expects 10 kHz mono audio via the 'score' signature.
+    Returns the score callable directly.
+    """
+    import tensorflow_hub as hub
+    model = hub.load("https://tfhub.dev/google/humpback_whale/1")
+    return model.signatures["score"]
+
+
+def score_chunk_whale(chunk, sr, score_fn, target_sr=10000):
+    """Score a chunk for humpback whale presence using Google's detector.
+
+    Args:
+        chunk: audio array at `sr` sample rate
+        sr: source sample rate (44100)
+        score_fn: the 'score' signature from the TF Hub model
+        target_sr: model's expected sample rate (10000 Hz)
+
+    Returns:
+        float: mean detection score (0-1). Higher = more whale.
+    """
+    import tensorflow as tf
+
+    # Resample to 10 kHz
+    resampled = librosa.resample(chunk, orig_sr=sr, target_sr=target_sr)
+
+    # Score signature expects (batch, samples, 1) float32
+    waveform = tf.constant(resampled, dtype=tf.float32)
+    waveform = tf.reshape(waveform, [1, -1, 1])
+
+    # Run detection via score signature (handles mel spectrogram internally)
+    # context_step_samples controls the hop between scoring windows
+    # Using the full context width (39124) for non-overlapping windows
+    result = score_fn(
+        waveform=waveform,
+        context_step_samples=tf.constant(39124, dtype=tf.int64),
+    )
+    scores = result["scores"]  # (batch, frames, 1)
+
+    return float(tf.reduce_mean(scores).numpy())
+
+
 # --- Detection data functions ---
 
 def load_detection_hours(det_dir, station, min_detection=0.8):
@@ -303,8 +382,14 @@ def _resample_chunked(audio, orig_sr, target_sr, chunk_duration=60.0):
 
 
 def preprocess_flac_cpu(flac_path, target_sr=44100, skip_seconds=5.0,
-                        whale_cv_threshold=0.8):
+                        whale_cv_threshold=0.8, energy_ratio_threshold=0.0,
+                        min_whale_rms=0.0):
     """CPU-only preprocessing: load → bandpass → segment → filter → loudness normalize.
+
+    Two-pass heuristic filtering:
+    1. Whale-band CV (existing): rejects steady-state noise
+    2. Spectrogram energy ratio: rejects broadband noise without whale-band concentration
+    3. Minimum whale-band RMS: rejects near-silence chunks
 
     Returns list of audio chunks (ready for GPU tokenization) and stats dict.
     """
@@ -345,6 +430,20 @@ def preprocess_flac_cpu(flac_path, target_sr=44100, skip_seconds=5.0,
         if cv < whale_cv_threshold:
             n_filtered += 1
             continue
+
+        # Spectrogram energy ratio filter
+        if energy_ratio_threshold > 0:
+            er = whale_energy_ratio(chunk, sr)
+            if er < energy_ratio_threshold:
+                n_filtered += 1
+                continue
+
+        # Minimum whale-band energy filter
+        if min_whale_rms > 0:
+            wb_rms = whale_band_rms(chunk, sr)
+            if wb_rms < min_whale_rms:
+                n_filtered += 1
+                continue
 
         # Loudness normalize (Pipeline B — no spectral gating)
         chunk = loudness_normalize(chunk, sr)
@@ -428,13 +527,18 @@ def process_flac_file(flac_path, tokenizer, target_sr=44100,
 
 def process_deployment(station, deployment_num, output_dir, det_dir,
                        tokenizer, whale_cv_threshold=0.8,
+                       energy_ratio_threshold=0.0, min_whale_rms=0.0,
+                       detector=None, detector_threshold=0.5,
                        min_detection=0.8, tmp_dir=None, dry_run=False,
-                       max_files=None, n_workers=None):
+                       max_files=None, n_workers=None,
+                       save_2d=False):
     """Download, process, and tokenize a single deployment.
 
-    Uses ProcessPoolExecutor for parallel download+CPU preprocessing (with
-    chunked resampling to limit per-worker RAM to ~1GB), then serial GPU
-    tokenization as results arrive.
+    Two-pass filtering:
+    - Pass 1 (heuristic): CV + energy ratio + min RMS (in preprocess_flac_cpu)
+    - Pass 2 (detector): Google humpback detector on survivors (optional)
+
+    Supports saving as 2D (n_codebooks, T) arrays for hierarchical models.
     """
     import torch
 
@@ -537,6 +641,8 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
         try:
             ready_chunks, stats = preprocess_flac_cpu(
                 local_path, whale_cv_threshold=whale_cv_threshold,
+                energy_ratio_threshold=energy_ratio_threshold,
+                min_whale_rms=min_whale_rms,
             )
 
             dep_stats["n_flacs_processed"] += 1
@@ -544,18 +650,38 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
             dep_stats["n_chunks_total"] += stats["n_chunks_total"]
             dep_stats["n_chunks_filtered"] += stats["n_chunks_filtered"]
 
+            # Pass 2: Google humpback detector (optional)
+            if detector is not None:
+                before_det = len(ready_chunks)
+                ready_chunks = [
+                    c for c in ready_chunks
+                    if score_chunk_whale(c, 44100, detector) >= detector_threshold
+                ]
+                dep_stats["n_chunks_filtered"] += before_det - len(ready_chunks)
+
             # GPU tokenization
             for chunk in ready_chunks:
                 chunk_tensor = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
                 codes, z = tokenizer.encode(chunk_tensor)
-                tokens = tokenizer.codes_to_sequence(codes)
 
-                if len(tokens) > 2:
-                    out_path = output_dir / f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
-                    np.save(out_path, tokens)
-                    chunk_idx += 1
-                    dep_stats["n_chunks_kept"] += 1
-                    dep_stats["n_tokens"] += len(tokens)
+                if save_2d:
+                    # Save as 2D (n_codebooks, T) for hierarchical models
+                    codes_np = codes[0].cpu().numpy().astype(np.int32)
+                    if codes_np.shape[1] > 2:
+                        out_path = output_dir / f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
+                        np.save(out_path, codes_np)
+                        chunk_idx += 1
+                        dep_stats["n_chunks_kept"] += 1
+                        dep_stats["n_tokens"] += codes_np.shape[1]
+                else:
+                    # Save as 1D interleaved (legacy format)
+                    tokens = tokenizer.codes_to_sequence(codes)
+                    if len(tokens) > 2:
+                        out_path = output_dir / f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
+                        np.save(out_path, tokens)
+                        chunk_idx += 1
+                        dep_stats["n_chunks_kept"] += 1
+                        dep_stats["n_tokens"] += len(tokens)
 
             # Mark FLAC as done (append to done file)
             with open(done_file, 'a') as f:
@@ -593,17 +719,31 @@ def main():
                         help="Process only this station (e.g., hi05). Default: all Hawaii stations")
     parser.add_argument("--deployment", type=int, default=None,
                         help="Process only this deployment number")
-    parser.add_argument("--output-dir", type=str,
-                        default="data/tokenized/sanctsound_humpback_4cb")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Output directory (default: auto from codec choice)")
     parser.add_argument("--det-dir", type=str,
                         default="data/sanctsound/detections")
-    parser.add_argument("--codec-path", type=str, default="models/codec.pth")
-    parser.add_argument("--n-codebooks", type=int, default=4)
+    parser.add_argument("--codec", choices=["lac", "dac"], default="lac",
+                        help="Audio codec: lac (WhAM) or dac (Descript Audio Codec)")
+    parser.add_argument("--codec-path", type=str, default="models/codec.pth",
+                        help="Path to LAC weights (only used with --codec lac)")
+    parser.add_argument("--n-codebooks", type=int, default=None,
+                        help="Number of codebooks (default: 4 for LAC, 9 for DAC)")
+    parser.add_argument("--save-2d", action="store_true",
+                        help="Save as 2D (n_codebooks, T) arrays for hierarchical models")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--min-detection", type=float, default=0.8,
                         help="Minimum humpback detection proportion (default: 0.8)")
     parser.add_argument("--whale-cv-threshold", type=float, default=0.8,
                         help="Minimum whale-band CV score to keep a chunk (default: 0.8)")
+    parser.add_argument("--energy-ratio-threshold", type=float, default=0.0,
+                        help="Minimum whale-band energy ratio (0=disabled, try 0.4)")
+    parser.add_argument("--min-whale-rms", type=float, default=0.0,
+                        help="Minimum whale-band RMS energy (0=disabled, try 0.01)")
+    parser.add_argument("--use-detector", action="store_true",
+                        help="Use Google humpback detector as Pass 2 filter")
+    parser.add_argument("--detector-threshold", type=float, default=0.5,
+                        help="Minimum detector score to keep a chunk (default: 0.5)")
     parser.add_argument("--max-files", type=int, default=None,
                         help="Max FLAC files per deployment (for testing)")
     parser.add_argument("--workers", type=int, default=None,
@@ -631,18 +771,42 @@ def main():
     if args.deployment is not None:
         stations = {s: [args.deployment] for s in stations}
 
+    # Set defaults based on codec choice
+    if args.n_codebooks is None:
+        args.n_codebooks = 9 if args.codec == "dac" else 4
+    if args.output_dir is None:
+        if args.codec == "dac":
+            args.output_dir = "data/tokenized/sanctsound_humpback_dac"
+        else:
+            args.output_dir = "data/tokenized/sanctsound_4cb"
+
     # Load tokenizer (unless dry run)
     tokenizer = None
     if not args.dry_run:
-        from src.tokenizer.audio_tokenizer import AudioTokenizer
-        print(f"Loading AudioTokenizer from {args.codec_path}...")
-        tokenizer = AudioTokenizer(
-            codec_path=args.codec_path,
-            device=args.device,
-            n_codebooks=args.n_codebooks,
-        )
-        print(f"  Sample rate: {tokenizer.sample_rate}, "
-              f"Tokens/sec: {tokenizer.tokens_per_second:.1f}")
+        if args.codec == "dac":
+            from src.tokenizer.dac_tokenizer import DACTokenizer
+            print(f"Loading DACTokenizer ({args.n_codebooks} codebooks)...")
+            tokenizer = DACTokenizer(
+                device=args.device,
+                n_codebooks=args.n_codebooks,
+            )
+        else:
+            from src.tokenizer.audio_tokenizer import AudioTokenizer
+            print(f"Loading AudioTokenizer from {args.codec_path}...")
+            tokenizer = AudioTokenizer(
+                codec_path=args.codec_path,
+                device=args.device,
+                n_codebooks=args.n_codebooks,
+            )
+        print(f"  Codec: {args.codec.upper()}, Sample rate: {tokenizer.sample_rate}, "
+              f"Tokens/sec: {tokenizer.tokens_per_second:.1f}, Codebooks: {args.n_codebooks}")
+
+    # Load Google humpback detector (Pass 2)
+    detector = None
+    if args.use_detector and not args.dry_run:
+        print("Loading Google humpback whale detector...")
+        detector = load_humpback_detector()
+        print(f"  Detector loaded, threshold: {args.detector_threshold}")
 
     # Process each station/deployment
     all_stats = []
@@ -654,10 +818,15 @@ def main():
                 det_dir=args.det_dir,
                 tokenizer=tokenizer,
                 whale_cv_threshold=args.whale_cv_threshold,
+                energy_ratio_threshold=args.energy_ratio_threshold,
+                min_whale_rms=args.min_whale_rms,
+                detector=detector,
+                detector_threshold=args.detector_threshold,
                 min_detection=args.min_detection,
                 dry_run=args.dry_run,
                 max_files=args.max_files,
                 n_workers=args.workers,
+                save_2d=args.save_2d,
             )
             all_stats.append(stats)
 
@@ -679,19 +848,35 @@ def main():
 
         # Save metadata
         output_dir = Path(args.output_dir)
+        pipeline_steps = "skip_test_tone → bandpass → segment → normalize → loudness_norm"
+        if args.energy_ratio_threshold > 0 or args.min_whale_rms > 0:
+            pipeline_steps += " → heuristic_filter"
+        if args.use_detector:
+            pipeline_steps += " → humpback_detector"
+        pipeline_steps += " → tokenize"
+        if args.save_2d:
+            pipeline_steps += " (2D)"
+
         meta = {
             "source": "sanctsound_hawaii_humpback",
-            "pipeline": "skip_test_tone → bandpass → segment → normalize → loudness_norm → tokenize",
+            "pipeline": pipeline_steps,
+            "codec": args.codec,
             "whale_cv_threshold": args.whale_cv_threshold,
+            "energy_ratio_threshold": args.energy_ratio_threshold,
+            "min_whale_rms": args.min_whale_rms,
+            "use_detector": args.use_detector,
+            "detector_threshold": args.detector_threshold if args.use_detector else None,
             "min_detection": args.min_detection,
-            "codec_path": args.codec_path,
             "n_codebooks": args.n_codebooks,
+            "save_2d": args.save_2d,
             "total_hours": round(total_hours, 1),
             "total_tokens": total_tokens,
             "total_chunks_kept": total_kept,
             "total_chunks_total": total_chunks,
             "deployments": all_stats,
         }
+        if args.codec == "lac":
+            meta["codec_path"] = args.codec_path
         if tokenizer:
             meta["sample_rate"] = tokenizer.sample_rate
             meta["tokens_per_second"] = tokenizer.tokens_per_second
