@@ -264,27 +264,35 @@ def score_chunk_whale(chunk, sr, score_fn, target_sr=10000):
         target_sr: model's expected sample rate (10000 Hz)
 
     Returns:
-        float: mean detection score (0-1). Higher = more whale.
+        float or None: mean detection score (0-1). Higher = more whale.
+            Returns None if scoring fails (e.g., chunk too short for model).
     """
     import tensorflow as tf
 
     # Resample to 10 kHz
     resampled = librosa.resample(chunk, orig_sr=sr, target_sr=target_sr)
 
-    # Score signature expects (batch, samples, 1) float32
-    waveform = tf.constant(resampled, dtype=tf.float32)
-    waveform = tf.reshape(waveform, [1, -1, 1])
+    # Model needs at least ~3.9s at 10kHz (39124 samples) for one scoring window
+    if len(resampled) < 39124:
+        return None
 
-    # Run detection via score signature (handles mel spectrogram internally)
-    # context_step_samples controls the hop between scoring windows
-    # Using the full context width (39124) for non-overlapping windows
-    result = score_fn(
-        waveform=waveform,
-        context_step_samples=tf.constant(39124, dtype=tf.int64),
-    )
-    scores = result["scores"]  # (batch, frames, 1)
+    try:
+        # Score signature expects (batch, samples, 1) float32
+        waveform = tf.constant(resampled, dtype=tf.float32)
+        waveform = tf.reshape(waveform, [1, -1, 1])
 
-    return float(tf.reduce_mean(scores).numpy())
+        # Run detection via score signature (handles mel spectrogram internally)
+        # context_step_samples controls the hop between scoring windows
+        # Using the full context width (39124) for non-overlapping windows
+        result = score_fn(
+            waveform=waveform,
+            context_step_samples=tf.constant(39124, dtype=tf.int64),
+        )
+        scores = result["scores"]  # (batch, frames, 1)
+
+        return float(tf.reduce_mean(scores).numpy())
+    except Exception:
+        return None
 
 
 def score_chunks_parallel(chunks, sr, score_fn, n_workers=8):
@@ -310,7 +318,8 @@ def append_score_rows(score_path, rows):
     with open(score_path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
             'npy_file', 'flac_name', 'chunk_idx_in_flac',
-            'whale_cv', 'energy_ratio', 'whale_rms', 'detector_score'])
+            'whale_cv', 'energy_ratio', 'whale_rms', 'detector_score',
+            'tokenized'])
         if write_header:
             writer.writeheader()
         writer.writerows(rows)
@@ -568,14 +577,20 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
                        tokenizer, whale_cv_threshold=0.8,
                        energy_ratio_threshold=0.0, min_whale_rms=0.0,
                        detector=None, detector_threshold=0.5,
+                       min_detector_score=0.1,
                        detector_workers=8,
                        min_detection=0.8, tmp_dir=None, dry_run=False,
                        max_files=None, n_workers=None,
                        save_2d=False):
     """Download, process, and tokenize a single deployment.
 
-    Tokenizes ALL chunks that pass heuristic filters (Pass 1). Detector scores
-    are saved to chunk_scores.csv for filtering at training time.
+    Chunks pass two filters before tokenization:
+      Pass 1: Heuristic (CV + energy ratio + whale RMS)
+      Pass 2: Google humpback detector (score >= min_detector_score)
+
+    All scores are saved to chunk_scores.csv. Chunks below min_detector_score
+    are recorded in the CSV but not tokenized, saving GPU time and disk space.
+    Further filtering by higher thresholds can be done at training time.
 
     Supports saving as 2D (n_codebooks, T) arrays for hierarchical models.
     """
@@ -654,6 +669,7 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
         "n_chunks_total": 0,
         "n_chunks_filtered": 0,
         "n_chunks_tokenized": 0,
+        "n_chunks_skipped_detector": 0,
         "n_chunks_above_threshold": 0,
         "n_tokens": 0,
     }
@@ -693,9 +709,24 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
             dep_stats["n_chunks_total"] += stats["n_chunks_total"]
             dep_stats["n_chunks_filtered"] += stats["n_chunks_filtered"]
 
-            # GPU tokenize ALL heuristic-passing chunks (no detector filtering)
+            # Parallel detector scoring on CPU threads (BEFORE tokenization)
+            if detector is not None and ready_chunks:
+                det_scores = score_chunks_parallel(
+                    ready_chunks, 44100, detector, n_workers=detector_workers)
+            else:
+                det_scores = [None] * len(ready_chunks)
+
+            # GPU tokenize only chunks above min_detector_score
             npy_names = []
-            for chunk in ready_chunks:
+            for j, chunk in enumerate(ready_chunks):
+                det_score = det_scores[j]
+
+                # Skip tokenization for chunks clearly not whale song
+                if det_score is not None and det_score < min_detector_score:
+                    npy_names.append(None)
+                    dep_stats["n_chunks_skipped_detector"] += 1
+                    continue
+
                 chunk_tensor = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
                 codes, z = tokenizer.encode(chunk_tensor)
 
@@ -722,23 +753,16 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
                     else:
                         npy_names.append(None)
 
-            # Parallel detector scoring on CPU threads
-            if detector is not None and ready_chunks:
-                det_scores = score_chunks_parallel(
-                    ready_chunks, 44100, detector, n_workers=detector_workers)
-            else:
-                det_scores = [None] * len(ready_chunks)
-
-            # Save scores to CSV
+            # Save ALL scores to CSV (including skipped chunks, for the record)
             score_rows = []
-            for npy_name, scores, det_score in zip(npy_names, chunk_scores, det_scores):
-                if npy_name is None:
-                    continue
+            for j, (scores, det_score) in enumerate(zip(chunk_scores, det_scores)):
+                npy_name = npy_names[j] if j < len(npy_names) else None
                 row = {
-                    'npy_file': npy_name,
+                    'npy_file': npy_name or '',
                     'flac_name': fname,
                     **scores,
                     'detector_score': round(det_score, 4) if det_score is not None else '',
+                    'tokenized': 'yes' if npy_name else 'no',
                 }
                 score_rows.append(row)
                 if det_score is not None and det_score >= detector_threshold:
@@ -764,15 +788,20 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
 
     # Print summary
     tokenized = dep_stats["n_chunks_tokenized"]
+    skipped = dep_stats["n_chunks_skipped_detector"]
     total = dep_stats["n_chunks_total"]
     above = dep_stats["n_chunks_above_threshold"]
+    heuristic_pass = tokenized + skipped
     pct = 100 * tokenized / max(total, 1)
     print(f"\n  {dep_str} summary:")
     print(f"    FLACs processed: {dep_stats['n_flacs_processed']}")
     print(f"    Duration: {dep_stats['file_duration']/3600:.1f} hours")
-    print(f"    Chunks tokenized: {tokenized}/{total} ({pct:.0f}%)")
+    print(f"    Chunks after heuristic filter: {heuristic_pass}/{total}")
     if detector is not None:
-        print(f"    Chunks above detector threshold: {above}/{tokenized}")
+        print(f"    Skipped by detector (< {min_detector_score}): {skipped}")
+    print(f"    Chunks tokenized: {tokenized} ({pct:.0f}%)")
+    if detector is not None:
+        print(f"    Chunks above training threshold ({detector_threshold}): {above}/{tokenized}")
     print(f"    Tokens: {dep_stats['n_tokens']:,}")
 
     return dep_stats
@@ -809,7 +838,9 @@ def main():
     parser.add_argument("--use-detector", action="store_true",
                         help="Use Google humpback detector to score chunks (scores saved to CSV)")
     parser.add_argument("--detector-threshold", type=float, default=0.5,
-                        help="Detector score threshold for summary stats (filtering is at training time)")
+                        help="Detector score threshold for summary stats (further filtering at training time)")
+    parser.add_argument("--min-detector-score", type=float, default=0.1,
+                        help="Minimum detector score to tokenize a chunk (default: 0.1, skips obvious non-whale)")
     parser.add_argument("--detector-workers", type=int, default=8,
                         help="Parallel threads for detector scoring (default: 8)")
     parser.add_argument("--max-files", type=int, default=None,
@@ -890,6 +921,7 @@ def main():
                 min_whale_rms=args.min_whale_rms,
                 detector=detector,
                 detector_threshold=args.detector_threshold,
+                min_detector_score=args.min_detector_score,
                 min_detection=args.min_detection,
                 dry_run=args.dry_run,
                 max_files=args.max_files,

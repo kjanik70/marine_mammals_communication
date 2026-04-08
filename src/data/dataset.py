@@ -188,9 +188,13 @@ def _load_accepted_files(score_file, min_score):
     accepted = set()
     with open(score_file) as f:
         for row in csv.DictReader(f):
+            # Skip rows that weren't tokenized (no .npy file)
+            npy = row.get('npy_file', '')
+            if not npy:
+                continue
             ds = row.get('detector_score', '')
             if ds == '' or float(ds) >= min_score:
-                accepted.add(row['npy_file'])
+                accepted.add(npy)
     return accepted
 
 
