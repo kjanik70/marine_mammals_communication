@@ -718,6 +718,34 @@ python3 scripts/eval_codec_quality.py --device cpu   # LAC only, various codeboo
 python3 scripts/eval_codec_comparison.py --device cpu # LAC vs DAC comparison
 ```
 
+## Future Enhancements
+
+### Temporal Chaining for Longer Context Training
+
+The `chunk_scores.csv` sidecar file preserves each chunk's position within its source FLAC via `chunk_idx_in_flac`. Analysis shows **89.7% of tokenized chunks are temporally adjacent** — consecutive 30s windows from the same recording that both passed the heuristic filters. This enables chaining adjacent chunks into longer training examples without re-downloading or re-tokenizing:
+
+| Context Length | Adjacent Chunks | Available Examples |
+|---|---|---|
+| 60s | 2 | ~249,000 |
+| 90s | 3 | ~200,000 |
+| 120s | 4 | ~166,000 |
+| 150s | 5 | ~139,000 |
+| 180s | 6 | ~118,000 |
+
+The longest consecutive run is **124 chunks (62 minutes)** of unbroken humpback song. At 60s context with DAC 9CB (86.1 T/s), each example would be ~5,162 tokens per codebook. Implementation: at dataset loading time, group by `flac_name`, sort by `chunk_idx_in_flac`, find consecutive runs, and concatenate `.npy` arrays with optional SEP tokens. This would let the model learn longer-range song structure — humpback songs repeat themes over 10–30 minutes.
+
+### DAC Re-tokenization (Pipeline E)
+
+Pipeline D used LAC 4CB (~3.2B tokens). A parallel DAC 9CB re-tokenization is in progress, which will produce ~1.2B tokens per codebook (~10.9B interleaved) with better reconstruction quality (xcorr 0.50 vs 0.14). DAC's finer temporal resolution (86.1 vs 57.4 T/s) and more codebooks (9 vs 4) capture spectral detail that LAC 4CB loses.
+
+### Additional Targets
+
+- Scale to more SanctSound stations: OC02 (Olympic Coast orcas), PM stations (Pacific humpback/orca)
+- Train medium/large models on combined denoised + SanctSound DAC data
+- Species-specific vs multi-species model comparison
+- Hierarchical codebook modeling (predict coarse codebooks first, then refine)
+- DolphinGemma integration (Google's dolphin communication model)
+
 ## References
 
 - Sharma, P. et al. "An automatic approach for learning sperm whale codas using a large audio recording dataset." *Nature Communications* 15, 3194 (2024). [doi:10.1038/s41467-024-47221-8](https://doi.org/10.1038/s41467-024-47221-8)
