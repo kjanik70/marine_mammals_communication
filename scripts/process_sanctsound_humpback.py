@@ -29,6 +29,8 @@ Usage:
 
 import argparse
 import csv
+import ctypes
+import gc
 import io
 import json
 import multiprocessing as mp
@@ -311,6 +313,54 @@ def score_chunks_parallel(chunks, sr, score_fn, n_workers=8):
     return scores
 
 
+def _preprocess_worker(flac_path, out_dir, kwargs):
+    """Worker function for subprocess-isolated preprocessing.
+
+    Runs in a child process that exits after returning results,
+    freeing all memory (96kHz FLACs peak at 10-15GB during resampling).
+    Results are saved as temp .npy files instead of pickled to avoid
+    serialization overhead for large chunk arrays.
+    """
+    ready_chunks, chunk_scores, stats = preprocess_flac_cpu(flac_path, **kwargs)
+    # Save chunks as individual .npy files in temp dir
+    chunk_paths = []
+    for i, chunk in enumerate(ready_chunks):
+        p = Path(out_dir) / f"chunk_{i:04d}.npy"
+        np.save(p, chunk)
+        chunk_paths.append(str(p))
+    # Save metadata
+    import json
+    meta = {'chunk_paths': chunk_paths, 'chunk_scores': chunk_scores, 'stats': stats}
+    with open(Path(out_dir) / 'meta.json', 'w') as f:
+        json.dump(meta, f)
+
+
+def preprocess_flac_subprocess(flac_path, **kwargs):
+    """Run preprocess_flac_cpu in a subprocess to isolate memory.
+
+    The subprocess exits after processing, freeing all transient memory
+    (10-15GB peak for 96kHz FLACs). Results are passed back via temp files.
+    """
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix='flac_prep_')
+    try:
+        p = mp.Process(target=_preprocess_worker, args=(flac_path, tmp, kwargs))
+        p.start()
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"Preprocessing subprocess exited with code {p.exitcode}")
+        # Load results
+        import json
+        with open(Path(tmp) / 'meta.json') as f:
+            meta = json.load(f)
+        ready_chunks = [np.load(p) for p in meta['chunk_paths']]
+        chunk_scores = meta['chunk_scores']
+        stats = meta['stats']
+        return ready_chunks, chunk_scores, stats
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def append_score_rows(score_path, rows):
     """Append score rows to chunk_scores.csv (creates with header if new)."""
     import csv
@@ -581,7 +631,7 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
                        detector_workers=8,
                        min_detection=0.8, tmp_dir=None, dry_run=False,
                        max_files=None, n_workers=None,
-                       save_2d=False):
+                       save_2d=False, max_flacs_per_run=None):
     """Download, process, and tokenize a single deployment.
 
     Chunks pass two filters before tokenization:
@@ -678,12 +728,24 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
     score_path = output_dir / "chunk_scores.csv"
 
     # Serial processing: download → preprocess → tokenize ALL → score → save scores → delete
+    n_processed_this_run = 0
     for blob in tqdm(filtered_blobs, desc=f"  {dep_str}"):
         fname = blob.name.split('/')[-1]
 
         # Skip already-processed FLACs
         if fname in done_flacs:
             continue
+
+        # Periodic restart to prevent memory leak accumulation
+        if max_flacs_per_run and n_processed_this_run >= max_flacs_per_run:
+            tqdm.write(f"  Reached {max_flacs_per_run} FLACs this run, exiting for restart...")
+            break
+
+        # Memory guard: exit if RSS exceeds threshold (prevents OOM with parallel processes)
+        rss_mb = int(open(f'/proc/{os.getpid()}/status').read().split('VmRSS:')[1].split('kB')[0].strip()) // 1024
+        if rss_mb > 8000 and n_processed_this_run > 0:
+            tqdm.write(f"  RSS={rss_mb}MB > 8GB, exiting for memory reset...")
+            break
 
         local_path = tmp_dir / fname
 
@@ -696,9 +758,9 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
                 dep_stats["n_flacs_failed"] += 1
                 continue
 
-        # CPU preprocessing + GPU tokenization + detector scoring
+        # CPU preprocessing (in subprocess to isolate 10-15GB peak memory) + GPU tokenization
         try:
-            ready_chunks, chunk_scores, stats = preprocess_flac_cpu(
+            ready_chunks, chunk_scores, stats = preprocess_flac_subprocess(
                 local_path, whale_cv_threshold=whale_cv_threshold,
                 energy_ratio_threshold=energy_ratio_threshold,
                 min_whale_rms=min_whale_rms,
@@ -729,9 +791,11 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
 
                 chunk_tensor = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
                 codes, z = tokenizer.encode(chunk_tensor)
+                del chunk_tensor, z  # free GPU memory immediately
 
                 if save_2d:
                     codes_np = codes[0].cpu().numpy().astype(np.int32)
+                    del codes
                     if codes_np.shape[1] > 2:
                         npy_name = f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
                         np.save(output_dir / npy_name, codes_np)
@@ -743,6 +807,7 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
                         npy_names.append(None)
                 else:
                     tokens = tokenizer.codes_to_sequence(codes)
+                    del codes
                     if len(tokens) > 2:
                         npy_name = f"sanctsound_{station}_{deployment_num:02d}_{chunk_idx:06d}.npy"
                         np.save(output_dir / npy_name, tokens)
@@ -773,10 +838,18 @@ def process_deployment(station, deployment_num, output_dir, det_dir,
             # Mark FLAC as done (append to done file)
             with open(done_file, 'a') as f:
                 f.write(fname + '\n')
+            n_processed_this_run += 1
 
         except Exception as e:
             tqdm.write(f"    Process failed {fname}: {e}")
             dep_stats["n_flacs_failed"] += 1
+
+        # Free CUDA memory to prevent VRAM fragmentation leak
+        torch.cuda.empty_cache()
+
+        # Force glibc to return freed memory to OS (prevents RSS growth from librosa/scipy fragmentation)
+        gc.collect()
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
 
         # Delete FLAC after processing
         if local_path.exists():
@@ -847,6 +920,8 @@ def main():
                         help="Max FLAC files per deployment (for testing)")
     parser.add_argument("--workers", type=int, default=None,
                         help="Number of parallel workers for download+preprocessing (default: cpu_count)")
+    parser.add_argument("--max-flacs-per-run", type=int, default=None,
+                        help="Max FLACs to process before exiting (for periodic restart to prevent memory leaks)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List files and estimate sizes without downloading")
     args = parser.parse_args()
@@ -928,6 +1003,7 @@ def main():
                 n_workers=args.workers,
                 save_2d=args.save_2d,
                 detector_workers=args.detector_workers,
+                max_flacs_per_run=args.max_flacs_per_run,
             )
             all_stats.append(stats)
 

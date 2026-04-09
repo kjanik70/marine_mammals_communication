@@ -61,6 +61,51 @@ class DACTokenizer:
         return self._sample_rate / self._hop_length
 
     @torch.no_grad()
+    def encode_batch(
+        self,
+        chunks: list[np.ndarray],
+        batch_size: int = 16,
+    ) -> list[np.ndarray]:
+        """Batch-encode multiple audio chunks to 2D codes arrays.
+
+        Pads chunks to the longest in each sub-batch, encodes together,
+        then trims codes back to each chunk's original length.
+
+        Args:
+            chunks: list of 1D numpy arrays (mono audio at sample_rate)
+            batch_size: GPU sub-batch size (16 fits comfortably in 16GB VRAM)
+
+        Returns:
+            list of (n_codebooks, T_i) int32 numpy arrays, one per chunk
+        """
+        results = []
+        for start in range(0, len(chunks), batch_size):
+            sub = chunks[start : start + batch_size]
+            lengths = [len(c) for c in sub]
+            max_len = max(lengths)
+
+            # Pad to max length in this sub-batch
+            padded = torch.zeros(len(sub), 1, max_len, dtype=torch.float32)
+            for i, c in enumerate(sub):
+                padded[i, 0, : len(c)] = torch.tensor(c, dtype=torch.float32)
+
+            padded = padded.to(self.device)
+            z, codes_batch, latents, _, _ = self.codec.encode(padded)
+
+            # Trim and offset
+            codes_batch = codes_batch[:, : self.n_codebooks, :] + 1
+
+            for i, orig_len in enumerate(lengths):
+                orig_tokens = orig_len // self._hop_length
+                codes_i = codes_batch[i, :, :orig_tokens].cpu().numpy().astype(np.int32)
+                if codes_i.shape[1] > 2:
+                    results.append(codes_i)
+                else:
+                    results.append(None)
+
+        return results
+
+    @torch.no_grad()
     def encode(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode audio to discrete tokens.
 
