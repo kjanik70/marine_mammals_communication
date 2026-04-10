@@ -16,6 +16,17 @@ class TransformerConfig:
     dropout: float = 0.1          # Dropout rate
     use_gradient_checkpointing: bool = False
 
+    # Sliding Window Attention
+    swa_window_size: int = 0      # 0 = all full attention
+    full_attention_every_n: int = 0  # Every N-th layer uses full attn, rest SWA
+                                     # e.g. 5 → 4 SWA per 1 full; 0 = all full
+
+    # Mixture of Experts — ALL FFN layers use MoE when n_experts > 1
+    n_experts: int = 1            # 1 = dense FFN, >1 = MoE on all layers
+    moe_top_k: int = 2            # Experts selected per token
+    expert_d_ff: int = 0          # Expert intermediate dim (0 = use d_ff)
+    moe_aux_weight: float = 0.01  # Load-balancing loss weight
+
     @property
     def d_head(self) -> int:
         return self.d_model // self.n_heads
@@ -54,12 +65,34 @@ XLARGE = TransformerConfig(
     use_gradient_checkpointing=True,
 )  # ~350M params
 
+SMALL_SWA_MOE = TransformerConfig(
+    n_layers=8, n_heads=8, d_model=512, d_ff=2048,
+    swa_window_size=512, full_attention_every_n=5,
+    n_experts=8, moe_top_k=2, expert_d_ff=512,
+)
+
+MEDIUM_SWA_MOE = TransformerConfig(
+    n_layers=12, n_heads=12, d_model=768, d_ff=3072,
+    swa_window_size=1024, full_attention_every_n=5,
+    n_experts=8, moe_top_k=2, expert_d_ff=768,
+)
+
+LARGE_SWA_MOE = TransformerConfig(
+    n_layers=16, n_heads=16, d_model=1024, d_ff=4096,
+    swa_window_size=1024, full_attention_every_n=5,
+    n_experts=8, moe_top_k=2, expert_d_ff=1024,
+    use_gradient_checkpointing=True,
+)
+
 PRESETS = {
     "tiny": TINY,
     "small": SMALL,
     "medium": MEDIUM,
     "large": LARGE,
     "xlarge": XLARGE,
+    "small_swa_moe": SMALL_SWA_MOE,
+    "medium_swa_moe": MEDIUM_SWA_MOE,
+    "large_swa_moe": LARGE_SWA_MOE,
 }
 
 

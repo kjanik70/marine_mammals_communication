@@ -115,7 +115,10 @@ class Trainer:
 
                 with torch.autocast(self.device, dtype=torch.bfloat16):
                     output = self.model(input_ids, attention_mask=attention_mask, targets=targets)
-                    loss = output["loss"] / self.config.grad_accumulation_steps
+                    loss = output["loss"]
+                    if "aux_loss" in output:
+                        loss = loss + self.model.config.moe_aux_weight * output["aux_loss"]
+                    loss = loss / self.config.grad_accumulation_steps
 
                 loss.backward()
 
@@ -134,6 +137,8 @@ class Trainer:
                         "lr": lr,
                         "elapsed_s": round(elapsed, 1),
                     }
+                    if "aux_loss" in output:
+                        entry["aux_loss"] = output["aux_loss"].item()
                     log_entries.append(entry)
                     print(
                         f"Step {step:5d} | Epoch {epoch:3d} | "

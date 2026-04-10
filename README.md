@@ -505,10 +505,13 @@ GPT-style causal transformer decoder with:
 
 - Token embedding + RoPE positional encoding
 - Causal self-attention (Flash Attention via `scaled_dot_product_attention`)
+- Sliding Window Attention (SWA) — optional, configurable window size and SWA:Full ratio
+- Sparse Mixture of Experts (MoE) — optional, replaces all dense FFN layers with routed experts
+- SwiGLU feed-forward network
 - bf16 mixed precision training
 - AdamW + cosine annealing with warmup
 
-### Size Presets
+### Dense Presets
 
 | Preset | Layers | Heads | d_model | d_ff | Params |
 |--------|--------|-------|---------|------|--------|
@@ -517,6 +520,49 @@ GPT-style causal transformer decoder with:
 | medium | 12 | 12 | 768 | 3,072 | ~113M |
 | large | 16 | 16 | 1,024 | 4,096 | ~200M |
 | xlarge | 24 | 16 | 1,280 | 5,120 | ~350M |
+
+### SWA + MoE Presets
+
+These presets replace most attention layers with **Sliding Window Attention** (local context, O(T×W) instead of O(T²)) and all FFN layers with **Mixture of Experts** (multiple smaller expert FFNs with top-K routing). This increases model capacity (total parameters) without proportional increase in per-token compute.
+
+| Preset | Layers | Heads | d_model | Experts | expert_d_ff | Top-K | SWA Window | Full Attn Every | Total Params |
+|--------|--------|-------|---------|---------|-------------|-------|------------|-----------------|--------------|
+| small_swa_moe | 8 | 8 | 512 | 8 | 512 | 2 | 512 | 5th layer | ~59M |
+| medium_swa_moe | 12 | 12 | 768 | 8 | 768 | 2 | 1,024 | 5th layer | ~199M |
+| large_swa_moe | 16 | 16 | 1,024 | 8 | 1,024 | 2 | 1,024 | 5th layer | ~471M |
+
+**Layer pattern** (example: `large_swa_moe`, 16 layers, `full_attention_every_n=5`):
+
+| Layers | Attention | FFN |
+|--------|-----------|-----|
+| 0–3 | SWA (window=1024) | MoE (8 experts, top-2) |
+| 4 | Full causal | MoE (8 experts, top-2) |
+| 5–8 | SWA | MoE |
+| 9 | Full causal | MoE |
+| 10–13 | SWA | MoE |
+| 14 | Full causal | MoE |
+| 15 | SWA | MoE |
+
+### SWA + MoE Configuration
+
+All parameters are configurable via YAML config or `get_config()` overrides:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `swa_window_size` | 0 (disabled) | Sliding window size in tokens. 0 = all layers use full attention. |
+| `full_attention_every_n` | 0 (disabled) | Every N-th layer uses full attention, rest use SWA. e.g. 5 = 4 SWA per 1 full, 7 = 6 SWA per 1 full. |
+| `n_experts` | 1 (dense) | Number of experts per MoE layer. 1 = standard dense FFN. >1 = MoE on all FFN layers. |
+| `moe_top_k` | 2 | Number of experts activated per token. |
+| `expert_d_ff` | 0 (use d_ff) | Expert intermediate dimension. 0 = same size as `d_ff`. Smaller values = more experts with less per-expert capacity. |
+| `moe_aux_weight` | 0.01 | Weight of the load-balancing auxiliary loss (prevents expert collapse). |
+
+**VRAM usage** (batch_size=1, vocab_size=1026):
+
+| Preset | seq_len=4096 | seq_len=8192 |
+|--------|-------------|-------------|
+| small_swa_moe (59M) | 2.0 GB | 4.9 GB |
+| medium_swa_moe (199M) | 4.5 GB | 9.4 GB |
+| large_swa_moe (471M) | 11.7 GB | OOM (16GB GPU) |
 
 ## Training Configurations
 
