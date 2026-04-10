@@ -1,0 +1,42 @@
+# Audio: Medium SWA+MoE (199M) on SanctSound Hawaii humpback — DAC coarse (CB0 only)
+# 8K context = 95s of audio — captures full humpback song phrases
+# SWA (window=1024) on most layers, full attention every 5th layer, MoE on all FFN
+# ~1.16B tokens, ~5.3 hr/epoch on RTX 5070 Ti
+model:
+  preset: medium_swa_moe
+  vocab_size: 1027    # 1024 codes + PAD(0) + offset(+1) + SEP(1026)
+  max_seq_len: 8192
+  dropout: 0.15
+  swa_window_size: 1024
+  full_attention_every_n: 5
+  n_experts: 8
+  moe_top_k: 2
+  expert_d_ff: 768
+  moe_aux_weight: 0.01
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/sanctsound_humpback_dac
+  max_seq_len: 8192
+  codebook_index: 0   # extract CB0 from 2D (9, T) .npy files
+  concat: true
+  sep_token: 1026     # 1024 + 2 (after +1 offset)
+  augment: false
+  score_file: data/tokenized/sanctsound_humpback_dac/chunk_scores.csv
+  min_detector_score: 0.5
+
+training:
+  learning_rate: 2.0e-4
+  weight_decay: 0.15
+  batch_size: 1
+  val_batch_size: 2
+  grad_accumulation_steps: 8   # effective batch size = 8
+  max_eval_batches: 200
+  num_epochs: 100
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+  log_interval: 50
+  eval_interval: 500
+  save_interval: 1000
+  patience: 25
+  output_dir: runs/audio_medium_swa_moe_sanctsound_humpback_dac_coarse_8k

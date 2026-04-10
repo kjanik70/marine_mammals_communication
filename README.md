@@ -786,11 +786,47 @@ Pipeline D used LAC 4CB (~3.2B tokens). A parallel DAC 9CB re-tokenization is in
 
 ### Additional Targets
 
-- Scale to more SanctSound stations: OC02 (Olympic Coast orcas), PM stations (Pacific humpback/orca)
 - Train medium/large models on combined denoised + SanctSound DAC data
 - Species-specific vs multi-species model comparison
 - Hierarchical codebook modeling (predict coarse codebooks first, then refine)
 - DolphinGemma integration (Google's dolphin communication model)
+
+### Additional Data Sources
+
+The NOAA GCS bucket (`gs://noaa-passive-bioacoustic`, anonymous access) contains **20+ TB** of passive acoustic data beyond the Hawaii stations already processed. All use the same FLAC format compatible with the existing pipeline.
+
+**SanctSound — Other Sanctuaries** (same format, just change `--station`):
+
+| Sanctuary | Stations | Est. Size | Key Species |
+|-----------|----------|-----------|-------------|
+| Stellwagen Bank NMS (MA) | sb01-03 | ~7 TB | Humpback, right whale, dolphins, fin |
+| Olympic Coast NMS (WA) | oc01-04 | ~1.4 TB | Killer whale, humpback, fin, blue |
+| Gray's Reef NMS (GA) | gr01-03 | ~1.7 TB | Right whale, humpback, dolphins |
+| Channel Islands NMS (CA) | ci01-05 | ~2.9 TB | Humpback, fin, blue |
+| Monterey Bay NMS (CA) | mb01-03 | ~1.3 TB | Humpback, blue, fin |
+| Florida Keys NMS | fk01-04 | ~2 TB | Dolphins, fin, right whale |
+| Papahanaumokuakea (HI) | pm01,02,05 | ~77+ GB | Humpback (GoogleAI detections available) |
+
+**Other GCS Bucket Programs:**
+
+| Program | Prefix | Est. Size | Species |
+|---------|--------|-----------|---------|
+| SWFSC CCES + PASCAL | `swfsc/audio/` | Multi-TB | Blue, fin, humpback, beaked (35 Pacific survey deployments) |
+| Navy MBARC LMR | `navy/audio/` | Multi-TB | Arctic bowhead, SoCal blue/fin/humpback (59 deployments) |
+| NEFSC | `nefsc/audio/` | ~760 GB | Right whale, humpback (Atlantic coast) |
+| SEFSC Gulf of Mexico | `sefsc/audio/gomex/` | ~184 GB | Sperm whale, beaked, Bryde's |
+| PIFSC 200kHz | `pifsc/audio/pipan_200/` | Multi-TB | Humpback, sperm whale (Hawaii HARP) |
+| NRS (Noise Reference) | `nrs/audio/` | ~3.6 TB | Various (12 stations, multi-year) |
+| DCLDE 2027 Killer Whales | `dclde/` | ~1.3 TB | Orca from 8 sources (annotated, CC-BY-4.0) |
+
+**External Sources:**
+
+| Source | Access | Est. Size | Notes |
+|--------|--------|-----------|-------|
+| MBARI Pacific Sound | AWS S3 `pacific-sound-16khz` (anonymous) | ~16 TB | 12 continuous years, 16kHz — needs resample or native-rate DAC |
+| Ocean Networks Canada | `data.oceannetworks.ca` (free account) | Multi-TB | Strait of Georgia orca/humpback hydrophones |
+
+**Priority order:** OC02 (orca+humpback) → PM01/02 (more Hawaii humpback) → SB01-03 (Stellwagen, 7 TB) → DCLDE 2027 killer whales (annotated).
 
 ## References
 
