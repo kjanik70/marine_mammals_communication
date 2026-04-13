@@ -44,6 +44,9 @@ class TrainConfig:
     # Evaluation
     max_eval_batches: int = 0    # 0 = full val set; >0 = cap eval to N batches
 
+    # Memory optimization
+    use_8bit_adam: bool = False   # Use bitsandbytes 8-bit Adam to reduce VRAM
+
 
 def get_lr(step: int, config: TrainConfig, total_steps: int = 0) -> float:
     """Cosine annealing with warmup."""
@@ -85,7 +88,11 @@ class Trainer:
             {"params": [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad],
              "weight_decay": 0.0},
         ]
-        self.optimizer = torch.optim.AdamW(param_groups, lr=config.learning_rate, betas=(0.9, 0.95))
+        if getattr(config, 'use_8bit_adam', False):
+            import bitsandbytes as bnb
+            self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=config.learning_rate, betas=(0.9, 0.95))
+        else:
+            self.optimizer = torch.optim.AdamW(param_groups, lr=config.learning_rate, betas=(0.9, 0.95))
 
         # Logging
         self.log_file = self.output_dir / "training_log.jsonl"

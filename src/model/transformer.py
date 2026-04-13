@@ -26,17 +26,18 @@ class RoPE(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
         self.max_seq_len = max_seq_len
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute cos and sin for rotary embeddings.
 
         Args:
             x: Tensor of shape (batch, seq_len, ...)
+            offset: Position offset for KV-cached generation
 
         Returns:
             (cos, sin) each of shape (1, seq_len, 1, d_head)
         """
         seq_len = x.shape[1]
-        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        t = torch.arange(offset, offset + seq_len, device=x.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)  # (seq_len, d_head/2)
         emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, d_head)
         cos = emb.cos().unsqueeze(0).unsqueeze(2)  # (1, seq_len, 1, d_head)
@@ -63,7 +64,6 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = config.n_heads
         self.d_head = config.d_head
         self.d_model = config.d_model
-
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
@@ -74,7 +74,8 @@ class CausalSelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
         # Project to Q, K, V
@@ -86,23 +87,33 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Apply RoPE
+        # Apply RoPE (cos/sin already offset-aware)
         cos = cos[:, :T, :, :]  # (1, T, 1, d_head)
         sin = sin[:, :T, :, :]
         q = apply_rope(q, cos.transpose(1, 2), sin.transpose(1, 2))
         k = apply_rope(k, cos.transpose(1, 2), sin.transpose(1, 2))
 
-        # Flash Attention via PyTorch SDPA (handles causal masking efficiently)
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=True,
-        )
+        # KV cache: append new K/V to cached
+        new_cache = None
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            k = torch.cat([cached_k, k], dim=2)
+            v = torch.cat([cached_v, v], dim=2)
+            new_cache = (k, v)
+            # Single new token attending to full history — no causal mask needed
+            attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        else:
+            new_cache = (k, v)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=True,
+            )
 
         # Reshape back
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(attn_out)
+        return self.out_proj(attn_out), new_cache
 
 
 class SlidingWindowAttention(nn.Module):
@@ -110,6 +121,7 @@ class SlidingWindowAttention(nn.Module):
 
     Same interface as CausalSelfAttention but restricts each token to
     attend only within a local window of swa_window_size tokens back.
+    The mask buffer is shared across all SWA layers (set by CausalTransformer).
     """
 
     def __init__(self, config: TransformerConfig):
@@ -123,12 +135,8 @@ class SlidingWindowAttention(nn.Module):
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
-        # Precompute causal sliding window mask
-        max_T = config.max_seq_len
-        mask = torch.tril(torch.ones(max_T, max_T, dtype=torch.bool))
-        mask = torch.triu(mask, diagonal=-(config.swa_window_size - 1))
-        swa_mask = torch.where(mask, 0.0, float('-inf'))
-        self.register_buffer('swa_mask', swa_mask, persistent=False)
+        # swa_mask is set by CausalTransformer._share_swa_mask()
+        self._swa_mask_ref = None
 
     def forward(
         self,
@@ -136,7 +144,8 @@ class SlidingWindowAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
         qkv = self.qkv_proj(x)
@@ -151,17 +160,31 @@ class SlidingWindowAttention(nn.Module):
         q = apply_rope(q, cos.transpose(1, 2), sin.transpose(1, 2))
         k = apply_rope(k, cos.transpose(1, 2), sin.transpose(1, 2))
 
-        # Sliding window causal mask: (1, 1, T, T)
-        attn_mask = self.swa_mask[:T, :T].unsqueeze(0).unsqueeze(0)
-
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout.p if self.training else 0.0,
-        )
+        # KV cache: append and trim to window size
+        new_cache = None
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            k = torch.cat([cached_k, k], dim=2)
+            v = torch.cat([cached_v, v], dim=2)
+            # Trim to window size
+            if k.shape[2] > self.window_size:
+                k = k[:, :, -self.window_size:, :]
+                v = v[:, :, -self.window_size:, :]
+            new_cache = (k, v)
+            # Single new token attending to cached window — no mask needed
+            attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        else:
+            new_cache = (k, v)
+            # Sliding window causal mask: (1, 1, T, T) — shared across layers
+            attn_mask = self._swa_mask_ref[:T, :T].unsqueeze(0).unsqueeze(0)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(attn_out)
+        return self.out_proj(attn_out), new_cache
 
 
 class FeedForward(nn.Module):
@@ -267,10 +290,12 @@ class TransformerBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), cos, sin, attention_mask)
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+        attn_out, new_cache = self.attn(self.attn_norm(x), cos, sin, attention_mask, kv_cache)
+        x = x + attn_out
         x = x + self.ff(self.ff_norm(x))
-        return x
+        return x, new_cache
 
 
 class CausalTransformer(nn.Module):
@@ -291,6 +316,17 @@ class CausalTransformer(nn.Module):
             TransformerBlock(config, layer_idx=i) for i in range(config.n_layers)
         ])
 
+        # Share a single SWA mask buffer across all sliding window layers
+        if config.swa_window_size > 0:
+            max_T = config.max_seq_len
+            mask = torch.tril(torch.ones(max_T, max_T, dtype=torch.bool))
+            mask = torch.triu(mask, diagonal=-(config.swa_window_size - 1))
+            swa_mask = torch.where(mask, 0.0, float('-inf'))
+            self.register_buffer('_swa_mask', swa_mask, persistent=False)
+            for block in self.blocks:
+                if isinstance(block.attn, SlidingWindowAttention):
+                    block.attn._swa_mask_ref = self._swa_mask
+
         self.norm = nn.RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -299,6 +335,15 @@ class CausalTransformer(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+
+    def _apply(self, fn):
+        """Override to re-link shared SWA mask after device moves (.to/.cuda/.cpu)."""
+        result = super()._apply(fn)
+        if hasattr(self, '_swa_mask'):
+            for block in self.blocks:
+                if isinstance(block.attn, SlidingWindowAttention):
+                    block.attn._swa_mask_ref = self._swa_mask
+        return result
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -313,6 +358,7 @@ class CausalTransformer(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
+        past_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> dict:
         """Forward pass.
 
@@ -320,27 +366,37 @@ class CausalTransformer(nn.Module):
             input_ids: (B, T) token IDs
             attention_mask: (B, T) mask (1=real, 0=padding)
             targets: (B, T) target token IDs for loss computation
+            past_kv: List of (K, V) caches per layer for generation
 
         Returns:
-            dict with 'logits' and optionally 'loss'
+            dict with 'logits' and optionally 'loss', 'past_kv'
         """
         B, T = input_ids.shape
 
         x = self.token_emb(input_ids)
         x = self.drop(x)
 
-        cos, sin = self.rope(x)
+        # Position offset for KV-cached generation
+        offset = past_kv[0][0].shape[2] if past_kv is not None else 0
+        cos, sin = self.rope(x, offset=offset)
 
-        for block in self.blocks:
+        new_kv = []
+        for i, block in enumerate(self.blocks):
+            layer_cache = past_kv[i] if past_kv is not None else None
             if self.config.use_gradient_checkpointing and self.training:
-                x = checkpoint(block, x, cos, sin, attention_mask, use_reentrant=False)
+                # Gradient checkpointing doesn't use KV cache (training only)
+                x, _ = checkpoint(block, x, cos, sin, attention_mask, None, use_reentrant=False)
             else:
-                x = block(x, cos, sin, attention_mask)
+                x, cache = block(x, cos, sin, attention_mask, layer_cache)
+                new_kv.append(cache)
 
         x = self.norm(x)
         logits = self.lm_head(x)
 
         result = {"logits": logits}
+
+        if new_kv:
+            result["past_kv"] = new_kv
 
         # Collect MoE auxiliary losses
         aux_losses = [block.ff._aux_loss for block in self.blocks
@@ -369,7 +425,10 @@ class CausalTransformer(nn.Module):
         top_p: float = 1.0,
         eos_token_id: int = 2,
     ) -> torch.Tensor:
-        """Autoregressive generation.
+        """Autoregressive generation with KV cache.
+
+        Prefills the cache with the prompt in one pass, then generates
+        one token at a time using cached K/V for O(1) per step.
 
         Args:
             input_ids: (B, T) starting token IDs
@@ -384,25 +443,26 @@ class CausalTransformer(nn.Module):
         """
         self.eval()
 
+        # Prefill: process full prompt and populate KV cache
+        prompt = input_ids[:, :self.config.max_seq_len]
+        result = self.forward(prompt)
+        past_kv = result.get("past_kv", None)
+        logits = result["logits"][:, -1, :]
+
+        generated = []
         for _ in range(max_new_tokens):
-            # Crop to max_seq_len if needed
-            idx_cond = input_ids if input_ids.size(1) <= self.config.max_seq_len else input_ids[:, -self.config.max_seq_len:]
-
-            result = self.forward(idx_cond)
-            logits = result["logits"][:, -1, :]  # (B, vocab_size)
-
+            # Sample next token
             if temperature == 0:
-                # Greedy
                 next_token = logits.argmax(dim=-1, keepdim=True)
             else:
-                logits = logits / temperature
+                scaled = logits / temperature
 
                 if top_k > 0:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float("inf")
+                    v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
+                    scaled[scaled < v[:, [-1]]] = -float("inf")
 
                 if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
                     cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
                     sorted_indices_to_remove = cumulative_probs > top_p
                     sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
@@ -410,17 +470,23 @@ class CausalTransformer(nn.Module):
                     indices_to_remove = sorted_indices_to_remove.scatter(
                         1, sorted_indices, sorted_indices_to_remove
                     )
-                    logits[indices_to_remove] = -float("inf")
+                    scaled[indices_to_remove] = -float("inf")
 
-                probs = logits.softmax(dim=-1)
+                probs = scaled.softmax(dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
 
-            input_ids = torch.cat([input_ids, next_token], dim=1)
+            generated.append(next_token)
 
-            # Stop if all sequences have generated EOS
             if (next_token == eos_token_id).all():
                 break
 
+            # Forward single token with KV cache
+            result = self.forward(next_token, past_kv=past_kv)
+            past_kv = result.get("past_kv", None)
+            logits = result["logits"][:, -1, :]
+
+        if generated:
+            input_ids = torch.cat([input_ids] + generated, dim=1)
         return input_ids
 
     def count_parameters(self) -> int:

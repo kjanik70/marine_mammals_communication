@@ -1,0 +1,45 @@
+# Audio: Large SWA+MoE (479M) on SanctSound humpback — DAC 9CB interleaved
+# 11K context = 1251 timesteps = 14.5s of audio per window
+# 8-bit Adam + shared SWA mask = 13.5 GB peak (3.1 GB headroom on 16GB)
+# SWA (window=1024) on most layers, full attention every 5th layer, MoE on all FFN
+# Gradient checkpointing enabled
+# Vocab: CB0=1-1024, CB1=1025-2048, ..., CB8=8193-9216, PAD=0, SEP=9218
+model:
+  preset: large_swa_moe
+  vocab_size: 9219        # 9×1024 + PAD(0) + offset(+1) + SEP(9218)
+  max_seq_len: 11264
+  dropout: 0.15
+  swa_window_size: 1024
+  full_attention_every_n: 5
+  n_experts: 8
+  moe_top_k: 2
+  expert_d_ff: 1024
+  moe_aux_weight: 0.01
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/sanctsound_humpback_dac
+  max_seq_len: 11264
+  interleave_codebooks: 9   # interleave all 9 DAC codebooks from 2D (9, T) files
+  concat: true
+  sep_token: 9218           # 9*1024 + 2
+  augment: false
+  score_file: data/tokenized/sanctsound_humpback_dac/chunk_scores.csv
+  min_detector_score: 0.7
+
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.15
+  batch_size: 1
+  val_batch_size: 2
+  grad_accumulation_steps: 8   # effective batch size = 8
+  max_eval_batches: 200
+  num_epochs: 2
+  warmup_steps: 1000
+  min_lr_ratio: 0.01
+  log_interval: 50
+  eval_interval: 1000
+  save_interval: 2000
+  patience: 50
+  use_8bit_adam: true
+  output_dir: runs/audio_large_swa_moe_sanctsound_humpback_dac_9cb_11k

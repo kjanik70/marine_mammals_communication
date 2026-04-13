@@ -224,6 +224,7 @@ class AudioTokenDataset(Dataset):
         concat: bool = False,
         sep_token: int | None = None,
         codebook_index: int | None = None,
+        interleave_codebooks: int | None = None,
         score_file: str | Path | None = None,
         min_detector_score: float | None = None,
     ):
@@ -237,6 +238,7 @@ class AudioTokenDataset(Dataset):
         self.concat = concat
         self.sep_token = sep_token
         self.codebook_index = codebook_index
+        self.interleave_codebooks = interleave_codebooks
 
         # Support multiple token directories
         if isinstance(token_dir, (list, tuple)):
@@ -266,6 +268,11 @@ class AudioTokenDataset(Dataset):
             results = [_scan_npy(f) for f in all_paths]
 
         scanned = [r for r in results if r is not None]
+
+        # Adjust token counts for interleaved codebooks (T -> T * n_codebooks)
+        if self.interleave_codebooks:
+            scanned = [(path, stem, n * self.interleave_codebooks)
+                       for path, stem, n in scanned]
 
         # Phase 2: Build index
         self._groups = []      # concat mode: list of _ConcatGroup
@@ -327,7 +334,14 @@ class AudioTokenDataset(Dataset):
 
     def _extract_1d(self, arr):
         """Extract 1D token sequence from array, handling 2D codebook files."""
-        if arr.ndim == 2 and self.codebook_index is not None:
+        if arr.ndim == 2 and self.interleave_codebooks:
+            # Interleave all codebooks with per-CB offsets:
+            # CB0: 1-1024, CB1: 1025-2048, ..., CB8: 8193-9216
+            C, T = arr.shape
+            offsets = np.arange(C).reshape(C, 1) * 1024
+            offset_arr = arr + offsets
+            return offset_arr.T.reshape(-1).astype(np.int32)
+        elif arr.ndim == 2 and self.codebook_index is not None:
             return arr[self.codebook_index, :]
         elif arr.ndim == 2:
             # No codebook_index specified — flatten first row as fallback

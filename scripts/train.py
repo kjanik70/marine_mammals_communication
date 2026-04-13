@@ -44,12 +44,14 @@ def main():
 
         # Common dataset kwargs
         codebook_index = cfg["data"].get("codebook_index", None)
+        interleave_codebooks = cfg["data"].get("interleave_codebooks", None)
         ds_kwargs = dict(
             max_seq_len=cfg["data"].get("max_seq_len", 512),
             vocab_size=vocab_size,
             concat=concat,
             sep_token=sep_token,
             codebook_index=codebook_index,
+            interleave_codebooks=interleave_codebooks,
             score_file=cfg["data"].get("score_file", None),
             min_detector_score=cfg["data"].get("min_detector_score", None),
         )
@@ -90,6 +92,8 @@ def main():
         print(f"Augmentation: {augment}, Concat: {concat}")
         if codebook_index is not None:
             print(f"Codebook index: {codebook_index} (extracting single codebook from 2D files)")
+        if interleave_codebooks:
+            print(f"Interleave: {interleave_codebooks} codebooks (9CB interleaved from 2D files)")
         print(f"Vocab size: {vocab_size}")
     else:
         # Symbolic datasets (Track 1)
@@ -154,6 +158,7 @@ def main():
         save_interval=cfg["training"]["save_interval"],
         patience=cfg["training"].get("patience", 20),
         max_eval_batches=cfg["training"].get("max_eval_batches", 0),
+        use_8bit_adam=cfg["training"].get("use_8bit_adam", False),
         output_dir=cfg["training"]["output_dir"],
     )
 
