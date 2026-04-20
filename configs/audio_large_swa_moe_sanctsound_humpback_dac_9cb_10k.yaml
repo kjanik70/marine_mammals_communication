@@ -1,7 +1,7 @@
 # Audio: Large SWA+MoE (479M) on SanctSound humpback — DAC 9CB interleaved
 # 10K context = 1137 timesteps = 13.2s of audio per window
-# 8-bit Adam + shared SWA mask = 12.4 GB peak (4.2 GB headroom on 16GB)
-# SWA (window=1024) on most layers, full attention every 5th layer, MoE on all FFN
+# 8-bit Adam + chunked SWA (no mask buffer) = 9.8 GB peak (6.5 GB headroom on 16GB)
+# Chunked SWA (is_causal per chunk) on most layers, full attention every 5th, MoE on all FFN
 # Gradient checkpointing enabled
 # Vocab: CB0=1-1024, CB1=1025-2048, ..., CB8=8193-9216, PAD=0, SEP=9218
 model:
@@ -42,4 +42,4 @@ training:
   save_interval: 2000
   patience: 50
   use_8bit_adam: true
-  output_dir: runs/audio_large_swa_moe_sanctsound_humpback_dac_9cb_10k
+  output_dir: runs/audio_large_swa_moe_sanctsound_humpback_dac_9cb_10k_v2

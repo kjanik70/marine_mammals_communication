@@ -403,7 +403,7 @@ export PYTHONPATH=.
 # Unconditional generation (all trained models)
 python3 scripts/generate_all.py --n-samples 5 --max-tokens 300 --temperature 0.9
 
-# Prompted generation (feed real whale audio, model continues)
+# Prompted generation — LAC 4CB models (feed real whale audio, model continues)
 python3 scripts/generate_prompted.py \
     --checkpoint runs/audio_medium_sanctsound_humpback_4cb/best_model.pt \
     --token-dir data/tokenized/sanctsound_humpback_4cb \
@@ -411,6 +411,60 @@ python3 scripts/generate_prompted.py \
 ```
 
 Generated WAV files are saved to `runs/<model>/generated/` (unconditional) and `runs/<model>/prompted/` (prompted).
+
+#### DAC 9CB generation
+
+DAC 9CB models use the Descript Audio Codec (9 codebooks, hop=512, ~86.1 tokens/sec per codebook). These require the `DACTokenizer` for decoding — **not** the LAC `AudioTokenizer`. The tokenized files are 2D arrays of shape `(9, T)` with the +1 PAD offset already applied.
+
+```python
+import numpy as np
+import torch
+import soundfile as sf
+from src.model.transformer import CausalTransformer
+from src.tokenizer.dac_tokenizer import DACTokenizer
+
+N_CB = 9
+SEP = 9218  # 9*1024 + 2
+
+# Load model
+ckpt = torch.load("runs/<dac_9cb_run>/best_model.pt", map_location="cuda", weights_only=False)
+model = CausalTransformer(ckpt["config"]).cuda()
+model.load_state_dict(ckpt["model_state_dict"])
+model.eval()
+
+# Load DAC codec (not LAC!)
+tokenizer = DACTokenizer(device="cpu", n_codebooks=N_CB)
+
+# Load and interleave a tokenized file
+raw = np.load("data/tokenized/sanctsound_humpback_dac/some_file.npy")  # (9, T)
+offsets = np.arange(N_CB).reshape(N_CB, 1) * 1024
+tokens_1d = (raw + offsets).T.reshape(-1).astype(np.int32)
+
+# Use first ~5s as prompt (86.1 * 9 ≈ 775 tokens/sec)
+prompt = tokens_1d[:3870]
+prompt_t = torch.tensor(prompt, dtype=torch.long, device="cuda").unsqueeze(0)
+
+# Generate continuation
+with torch.no_grad():
+    generated = model.generate(
+        prompt_t,
+        max_new_tokens=ckpt["config"].max_seq_len - len(prompt),
+        temperature=0.85,
+        top_k=80,
+        eos_token_id=-1,
+    )
+
+# Decode to audio using DACTokenizer
+full_tokens = generated[0].cpu().numpy()
+audio = tokenizer.decode_tokens_to_audio(full_tokens, n_codebooks=N_CB, sep_token=SEP)
+sf.write("output.wav", audio, tokenizer.sample_rate)
+```
+
+**Important notes for DAC 9CB:**
+- Use `DACTokenizer`, not `AudioTokenizer` (LAC). DAC and LAC are different codecs with different codebook structures.
+- The 2D `.npy` files already have the +1 PAD offset. Interleave by adding `cb_index * 1024` — do **not** add an extra +1.
+- Vocab layout: CB0=1–1024, CB1=1025–2048, ..., CB8=8193–9216, PAD=0, SEP=9218, vocab_size=9219.
+- DAC sample rate is 44,100 Hz with hop_length=512 (~86.1 tokens/sec per codebook, ~775 interleaved tokens/sec).
 
 ### 7. Evaluate symbolic models
 
@@ -636,7 +690,8 @@ marine_mammals_communication/
 │       ├── baleen_4cb/               # Baleen whale tokens (4CB)
 │       ├── denoised_4cb/             # Denoised long-chunk tokens (4CB)
 │       ├── sanctsound_4cb/           # SanctSound pilot tokens (4CB)
-│       └── sanctsound_humpback_4cb/ # SanctSound humpback tokens (4CB, ~497K files)
+│       ├── sanctsound_humpback_4cb/ # SanctSound humpback tokens (4CB, ~497K files)
+│       └── sanctsound_humpback_dac/ # SanctSound humpback tokens (DAC 9CB, ~488K files)
 ├── models/
 │   └── codec.pth                     # WhAM LAC codec weights (not in git)
 ├── runs/                             # Training outputs (not in git)
@@ -682,7 +737,8 @@ marine_mammals_communication/
 │   │   ├── dialogue_builder.py       # Reconstruct multi-whale dialogues
 │   │   └── dataset.py                # PyTorch Dataset classes
 │   ├── tokenizer/
-│   │   └── audio_tokenizer.py        # LAC codec wrapper (encode/decode)
+│   │   ├── audio_tokenizer.py        # LAC codec wrapper (encode/decode)
+│   │   └── dac_tokenizer.py          # DAC codec wrapper (encode/decode, 9 codebooks)
 │   ├── model/
 │   │   ├── config.py                 # Model size presets (tiny→xlarge)
 │   │   └── transformer.py            # Causal transformer decoder

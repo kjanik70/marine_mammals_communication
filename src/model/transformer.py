@@ -135,8 +135,6 @@ class SlidingWindowAttention(nn.Module):
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
-        # swa_mask is set by CausalTransformer._share_swa_mask()
-        self._swa_mask_ref = None
 
     def forward(
         self,
@@ -175,13 +173,43 @@ class SlidingWindowAttention(nn.Module):
             attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         else:
             new_cache = (k, v)
-            # Sliding window causal mask: (1, 1, T, T) — shared across layers
-            attn_mask = self._swa_mask_ref[:T, :T].unsqueeze(0).unsqueeze(0)
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout.p if self.training else 0.0,
-            )
+            W = self.window_size
+            if self.training:
+                # Chunked SWA: split into window-sized chunks with overlap,
+                # using is_causal=True (flash kernel, no mask tensor needed).
+                if T <= W:
+                    attn_out = F.scaled_dot_product_attention(
+                        q, k, v, is_causal=True,
+                        dropout_p=self.dropout.p if self.training else 0.0)
+                else:
+                    n_chunks = (T + W - 1) // W
+                    outputs = []
+                    for c in range(n_chunks):
+                        q_start = c * W
+                        q_end = min((c + 1) * W, T)
+                        k_start = max(0, (c - 1) * W)
+                        k_end = q_end
+                        out_chunk = F.scaled_dot_product_attention(
+                            q[:, :, q_start:q_end, :],
+                            k[:, :, k_start:k_end, :],
+                            v[:, :, k_start:k_end, :],
+                            is_causal=True,
+                            dropout_p=self.dropout.p if self.training else 0.0)
+                        outputs.append(out_chunk)
+                    attn_out = torch.cat(outputs, dim=2)
+            else:
+                # Eval/generation prefill: exact SWA mask computed on the fly.
+                # Chunked SWA sees up to 2W context (not exactly W) which
+                # changes hidden states enough to break generation quality.
+                if T <= W:
+                    attn_out = F.scaled_dot_product_attention(
+                        q, k, v, is_causal=True, dropout_p=0.0)
+                else:
+                    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=q.device))
+                    mask = torch.triu(mask, diagonal=-(W - 1))
+                    swa_mask = torch.where(mask, 0.0, float('-inf'))
+                    attn_out = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=swa_mask, dropout_p=0.0)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(attn_out), new_cache
@@ -316,17 +344,6 @@ class CausalTransformer(nn.Module):
             TransformerBlock(config, layer_idx=i) for i in range(config.n_layers)
         ])
 
-        # Share a single SWA mask buffer across all sliding window layers
-        if config.swa_window_size > 0:
-            max_T = config.max_seq_len
-            mask = torch.tril(torch.ones(max_T, max_T, dtype=torch.bool))
-            mask = torch.triu(mask, diagonal=-(config.swa_window_size - 1))
-            swa_mask = torch.where(mask, 0.0, float('-inf'))
-            self.register_buffer('_swa_mask', swa_mask, persistent=False)
-            for block in self.blocks:
-                if isinstance(block.attn, SlidingWindowAttention):
-                    block.attn._swa_mask_ref = self._swa_mask
-
         self.norm = nn.RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -335,15 +352,6 @@ class CausalTransformer(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
-
-    def _apply(self, fn):
-        """Override to re-link shared SWA mask after device moves (.to/.cuda/.cpu)."""
-        result = super()._apply(fn)
-        if hasattr(self, '_swa_mask'):
-            for block in self.blocks:
-                if isinstance(block.attn, SlidingWindowAttention):
-                    block.attn._swa_mask_ref = self._swa_mask
-        return result
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -377,7 +385,9 @@ class CausalTransformer(nn.Module):
         x = self.drop(x)
 
         # Position offset for KV-cached generation
-        offset = past_kv[0][0].shape[2] if past_kv is not None else 0
+        # Use max cache size across layers — SWA layers trim their cache,
+        # but full attention layers keep the full history.
+        offset = max(kv[0].shape[2] for kv in past_kv) if past_kv is not None else 0
         cos, sin = self.rope(x, offset=offset)
 
         new_kv = []

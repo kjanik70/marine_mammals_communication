@@ -98,6 +98,22 @@ class Trainer:
         self.log_file = self.output_dir / "training_log.jsonl"
         self.best_val_loss = float("inf")
         self.saved_checkpoints = []  # (val_loss, path) tuples
+        # Scan for existing checkpoints so save_top_k pruning works across restarts
+        for ckpt_file in sorted(self.output_dir.glob("checkpoint_step*.pt")):
+            try:
+                meta = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+                self.saved_checkpoints.append((meta["val_loss"], ckpt_file))
+            except Exception:
+                pass  # skip corrupt/unreadable checkpoints
+        if self.saved_checkpoints:
+            self.saved_checkpoints.sort(key=lambda x: x[0])
+            print(f"Found {len(self.saved_checkpoints)} existing checkpoints in {self.output_dir}")
+            # Prune immediately if we already exceed save_top_k
+            while len(self.saved_checkpoints) > self.config.save_top_k:
+                _, old_path = self.saved_checkpoints.pop()
+                if old_path.exists():
+                    old_path.unlink()
+                    print(f"  Pruned {old_path.name}")
 
     def train(self):
         """Run the full training loop."""
