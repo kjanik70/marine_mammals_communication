@@ -55,9 +55,9 @@ These models use 4 interleaved LAC codebooks for richer audio representation and
 
 > **Note**: Val loss is not directly comparable between 1CB and 4CB models — the 4CB vocabulary is 4x larger (4099 vs 1026), making per-token prediction harder. The real comparison is in generated audio quality: 4CB captures finer spectral detail that 1CB misses.
 
-### Audio Models — SanctSound Humpback (Large-Scale, 4CB)
+### Audio Models — SanctSound Humpback (Large-Scale, 4CB LAC)
 
-Trained on ~3.2B tokens from 497K SanctSound Hawaii humpback files (Pipeline D). These models use longer context windows (2048–4096 tokens) and lazy-loading datasets to handle the scale.
+Trained on ~3.2B tokens from 497K SanctSound Hawaii humpback files (Pipeline D, LAC codec). These models use longer context windows (2048–4096 tokens) and lazy-loading datasets to handle the scale.
 
 | Model | Context | Params | Batch | Val Loss | Perplexity | Notes |
 |-------|---------|--------|-------|----------|------------|-------|
@@ -70,6 +70,21 @@ Key observations:
 - **Larger model beats smaller**: The large model (273M) surpassed both medium models (116M) by step ~15K and continued improving.
 - **Gradient checkpointing enables large batches**: The large model fits batch_size=16 at 11GB with gradient checkpointing, vs the medium model needing batch_size=4 at 10.6GB without it.
 - **Prompted generation works**: Feeding 5s of real whale audio as a prompt produces more coherent continuations than unconditional generation from random tokens.
+
+### Audio Models — SanctSound Humpback (Large-Scale, DAC 9CB)
+
+Re-tokenized with Descript Audio Codec (9 codebooks, ~10.4B interleaved tokens from 488K files). DAC has better reconstruction quality than LAC 4CB (xcorr 0.50 vs 0.14) and finer temporal resolution (86.1 vs 57.4 tokens/sec). Uses SWA+MoE architecture with 10K token context (13.2s of audio per window).
+
+| Model | Context | Params | Batch | Val Loss | Perplexity | Notes |
+|-------|---------|--------|-------|----------|------------|-------|
+| Medium SWA+MoE | 10240 | 199M | 1 (eff 8) | — | — | Completed, superseded by large |
+| **Large SWA+MoE** | **10240** | **479M** | **1 (eff 8)** | **5.335** | **~208** | **24% through epoch 0, still improving** |
+
+Key observations:
+- **Chunked SWA eliminates O(T²) mask**: Training uses `is_causal=True` per chunk instead of a `(T×T)` float mask. Saves 400MB VRAM at 10K context, enables Flash Attention kernel.
+- **8-bit Adam + gradient checkpointing**: Fits the 479M-param model in 13.1GB VRAM on RTX 5070 Ti (16GB), leaving 3GB headroom.
+- **Higher perplexity expected**: Vocab is 9219 (9×1024 + PAD + SEP) vs 4099 for 4CB LAC. The model predicts finer-grained tokens across 9 codebooks.
+- **DAC 9CB generation quality**: Three bugs were fixed in the generation pipeline (extra +1 offset, wrong codec used for decoding, KV cache RoPE offset in SWA layers). After fixes: 0% codebook violations, coherent audio output.
 
 ### Audio Quality Grading
 
@@ -291,29 +306,48 @@ The pipeline per file:
 
 Builds on Pipeline C with three key improvements: (1) skips the 5-second test tone at the start of each FLAC, (2) uses NOAA detection annotations to process only high-detection hours (>80% humpback), and (3) applies a whale-band variability filter to keep only chunks with actual vocalizations. Processes one deployment at a time, streaming FLACs from GCS and deleting them after tokenization to manage disk space.
 
+Supports both LAC (4CB) and DAC (9CB) codecs via `--codec` flag:
+
 ```bash
 export PYTHONPATH=.
 
-# Process all Hawaii stations (hi01, hi03, hi04, hi05)
+# Process with LAC 4CB (original codec)
 python3 scripts/process_sanctsound_humpback.py
+# → data/tokenized/sanctsound_humpback_4cb/
+
+# Process with DAC 9CB (better reconstruction, finer temporal resolution)
+python3 scripts/process_sanctsound_humpback.py --codec dac --save-2d
+# → data/tokenized/sanctsound_humpback_dac/
+
+# With Google humpback detector for chunk-level scoring
+python3 scripts/process_sanctsound_humpback.py --codec dac --save-2d --use-detector
+# Scores saved to chunk_scores.csv, filterable at training time via min_detector_score
 
 # Process a specific station and deployment
-python3 scripts/process_sanctsound_humpback.py --station hi04 --deployment 2
+python3 scripts/process_sanctsound_humpback.py --codec dac --save-2d --station hi04 --deployment 2
 
 # Dry run (list qualifying FLACs without downloading)
 python3 scripts/process_sanctsound_humpback.py --station hi05 --dry-run
-# → data/tokenized/sanctsound_humpback_4cb/
 ```
 
 The pipeline per file:
-1. Load FLAC, convert to mono, resample to 44,100 Hz
+1. Load FLAC, convert to mono, resample to 44,100 Hz (chunked to limit memory)
 2. Skip first 5 seconds (test tone present in all SanctSound recordings)
 3. Bandpass filter 80 Hz – 20 kHz
 4. Segment into ≤30s chunks, remove silence >4s
 5. Per-chunk peak normalization to 0.9
 6. **Whale-band variability filter**: compute coefficient of variation of RMS energy in 200–4000 Hz band (0.5s frames). Keep chunks with CV > 0.8 (whale songs ~1.5–3.5, ocean noise ~0.3–0.5)
 7. Loudness normalization to -20 LUFS (**no spectral gating** — it removes faint whale calls)
-8. Tokenize with LAC codec (4 codebooks)
+8. Optional: Google humpback detector scoring (TF Hub, CPU-only, parallel threaded)
+9. Tokenize with LAC 4CB or DAC 9CB codec
+10. Save as 1D interleaved (LAC) or 2D `(n_codebooks, T)` arrays (DAC with `--save-2d`)
+
+**DAC 9CB specifics:**
+- Saves as 2D `(9, T)` numpy arrays with +1 PAD offset already applied
+- Interleaving at training time: add `cb_index * 1024` per codebook (no extra +1)
+- Vocab: CB0=1–1024, CB1=1025–2048, ..., CB8=8193–9216, PAD=0, SEP=9218, vocab_size=9219
+- ~86.1 tokens/sec per codebook, ~775 interleaved tokens/sec
+- `chunk_scores.csv` sidecar with heuristic scores (whale_cv, energy_ratio, whale_rms) and optional detector_score for training-time filtering
 
 **Key lessons learned from SanctSound processing:**
 - **No spectral gating**: Standard noise reduction (spectral gating) destroys faint whale calls in low-SNR hydrophone data. Bandpass + loudness normalization preserves them.
@@ -513,7 +547,17 @@ Processed via Pipeline D (detection-guided, whale-band CV filter):
 | HI05 | Kona, Hawaii | 01 | ~135 | 6,937 | ~44M |
 | **Total** | | **10** | **~2,822** | **497,444** | **~3.2B** |
 
-The full SanctSound dataset contains ~25,000 FLAC files across 31 stations. Future expansion targets: OC02 (Olympic Coast orcas), PM stations (Pacific humpback/orca).
+**DAC 9CB re-tokenization** (Pipeline D with `--codec dac --save-2d`):
+
+| Station | Token files (DAC) | Tokens (interleaved) | Notes |
+|---------|-------------------|---------------------|-------|
+| HI01 | 146,083 | ~3.1B | |
+| HI03 | 97,758 | ~2.1B | |
+| HI04 | 235,875 | ~5.1B | |
+| HI05 | 6,088 | ~130M | |
+| **Total** | **485,804** | **~10.4B** | **avg ~21K tokens/chunk** |
+
+The full SanctSound dataset contains ~96,000 FLAC files across 31 stations (~28 TB). Future expansion targets: OC01-04 (Olympic Coast orcas, ~643 hours annotated), PM stations (Pacific humpback).
 
 **Species frequency compatibility**: Humpback (80–8,000 Hz), orca (1–25 kHz), and dolphins (2–150 kHz) work well with the LAC codec's 400 Hz+ range. Blue whale (10–100 Hz) and fin whale (15–30 Hz) are below the bandpass and cannot be used.
 
@@ -638,6 +682,7 @@ All configs are in `configs/`. Key configs:
 | `audio_small_denoised_4cb.yaml` | Audio 4CB | small | Denoised long-chunk (30s) | LR 2e-4, batch 8, seq_len 1024, vocab 4099 |
 | `audio_medium_sanctsound_humpback_4cb.yaml` | Audio 4CB | medium | SanctSound humpback (~3.2B tokens) | LR 2e-4, batch 2, grad_accum 4, seq_len 4096, vocab 4099 |
 | `audio_large_sanctsound_humpback_4cb.yaml` | Audio 4CB | large | SanctSound humpback (~3.2B tokens) | LR 1.5e-4, batch 8, seq_len 4096, vocab 4099 |
+| `audio_large_swa_moe_sanctsound_humpback_dac_9cb_10k.yaml` | Audio DAC 9CB | large_swa_moe | SanctSound humpback (~10.4B tokens) | LR 1e-4, batch 1 (eff 8), seq_len 10240, vocab 9219, SWA+MoE |
 
 Token-level augmentation (for audio track): random token noise (±1-3), token masking, and time stretching.
 
@@ -659,7 +704,8 @@ marine_mammals_communication/
 │   ├── audio_small_all_4cb_ab.yaml   # Audio, all species A+B quality (small, 4CB)
 │   ├── audio_small_denoised_4cb.yaml # Audio, denoised long-chunk (small, 4CB)
 │   ├── audio_medium_sanctsound_humpback_4cb.yaml # SanctSound humpback (medium, 4CB)
-│   └── audio_large_sanctsound_humpback_4cb.yaml  # SanctSound humpback (large, 4CB)
+│   ├── audio_large_sanctsound_humpback_4cb.yaml  # SanctSound humpback (large, 4CB)
+│   └── audio_large_swa_moe_sanctsound_humpback_dac_9cb_10k.yaml # SanctSound humpback (large SWA+MoE, DAC 9CB)
 ├── data/
 │   ├── raw/                          # Downloaded datasets (not in git)
 │   │   ├── ceti/                     # CETI annotation CSVs
@@ -836,13 +882,9 @@ The `chunk_scores.csv` sidecar file preserves each chunk's position within its s
 
 The longest consecutive run is **124 chunks (62 minutes)** of unbroken humpback song. At 60s context with DAC 9CB (86.1 T/s), each example would be ~5,162 tokens per codebook. Implementation: at dataset loading time, group by `flac_name`, sort by `chunk_idx_in_flac`, find consecutive runs, and concatenate `.npy` arrays with optional SEP tokens. This would let the model learn longer-range song structure — humpback songs repeat themes over 10–30 minutes.
 
-### DAC Re-tokenization (Pipeline E)
-
-Pipeline D used LAC 4CB (~3.2B tokens). A parallel DAC 9CB re-tokenization is in progress, which will produce ~1.2B tokens per codebook (~10.9B interleaved) with better reconstruction quality (xcorr 0.50 vs 0.14). DAC's finer temporal resolution (86.1 vs 57.4 T/s) and more codebooks (9 vs 4) capture spectral detail that LAC 4CB loses.
-
 ### Additional Targets
 
-- Train medium/large models on combined denoised + SanctSound DAC data
+- Orca data pipeline: Process ~643 hours of manually annotated killer whale vocalizations from Olympic Coast (OC01-04) with ecotype labels (Southern Resident, Northern Resident, Transient)
 - Species-specific vs multi-species model comparison
 - Hierarchical codebook modeling (predict coarse codebooks first, then refine)
 - DolphinGemma integration (Google's dolphin communication model)
