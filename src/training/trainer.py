@@ -34,7 +34,7 @@ class TrainConfig:
     log_interval: int = 10       # Log every N steps
     eval_interval: int = 50      # Evaluate every N steps
     save_interval: int = 200     # Save checkpoint every N steps
-    save_top_k: int = 3          # Keep top K checkpoints by val loss
+    save_top_k: int = 2          # Keep N most recent checkpoint_step*.pt files (best_model.pt always kept separately)
     output_dir: str = "runs/default"
 
     # Early stopping
@@ -97,34 +97,54 @@ class Trainer:
         # Logging
         self.log_file = self.output_dir / "training_log.jsonl"
         self.best_val_loss = float("inf")
-        self.saved_checkpoints = []  # (val_loss, path) tuples
-        # Scan for existing checkpoints so save_top_k pruning works across restarts
+        self.saved_checkpoints = []  # ordered list of paths, oldest first
+        self._resume_step = 0
+
+        # Scan existing checkpoints: prune to save_top_k most recent, then resume from latest
+        candidates = []  # (step_num, path, state_dict)
         for ckpt_file in sorted(self.output_dir.glob("checkpoint_step*.pt")):
             try:
-                meta = torch.load(ckpt_file, map_location="cpu", weights_only=False)
-                self.saved_checkpoints.append((meta["val_loss"], ckpt_file))
+                step_num = int(ckpt_file.stem.replace("checkpoint_step", ""))
+                ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+                candidates.append((step_num, ckpt_file, ckpt))
             except Exception:
-                pass  # skip corrupt/unreadable checkpoints
-        if self.saved_checkpoints:
-            self.saved_checkpoints.sort(key=lambda x: x[0])
-            print(f"Found {len(self.saved_checkpoints)} existing checkpoints in {self.output_dir}")
-            # Prune immediately if we already exceed save_top_k
-            while len(self.saved_checkpoints) > self.config.save_top_k:
-                _, old_path = self.saved_checkpoints.pop()
+                pass
+
+        if candidates:
+            print(f"Found {len(candidates)} existing checkpoints in {self.output_dir}")
+            # Sort by step, keep N most recent
+            candidates.sort(key=lambda x: x[0])
+            while len(candidates) > self.config.save_top_k:
+                old_step, old_path, _ = candidates.pop(0)
                 if old_path.exists():
                     old_path.unlink()
                     print(f"  Pruned {old_path.name}")
 
+            self.saved_checkpoints = [p for _, p, _ in candidates]
+
+            # Resume from the most recent surviving checkpoint
+            resume_step, resume_path, ckpt = candidates[-1]
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            self.best_val_loss = ckpt["val_loss"]
+            self._resume_step = resume_step
+            print(f"  Resuming from {resume_path.name} (step {resume_step}, val_loss {ckpt['val_loss']:.4f})")
+
     def train(self):
         """Run the full training loop."""
-        step = 0
+        step = self._resume_step
         self.model.train()
 
         log_entries = []
         start_time = time.time()
         total_steps = self.config.num_epochs * len(self.train_loader)
 
-        for epoch in range(self.config.num_epochs):
+        # Skip epochs already completed before the resume point
+        start_epoch = step // max(len(self.train_loader), 1)
+        if step > 0:
+            print(f"  Resuming at step {step} (epoch {start_epoch}, LR {get_lr(step, self.config, total_steps):.2e})")
+
+        for epoch in range(start_epoch, self.config.num_epochs):
             for batch in self.train_loader:
                 # Update learning rate
                 lr = get_lr(step, self.config, total_steps)
@@ -232,7 +252,7 @@ class Trainer:
         return total_loss / max(n_batches, 1)
 
     def save_checkpoint(self, step: int, val_loss: float, is_best: bool = False):
-        """Save model checkpoint."""
+        """Save model checkpoint, keeping only the N most recent on disk."""
         ckpt_path = self.output_dir / f"checkpoint_step{step}.pt"
         torch.save({
             "step": step,
@@ -242,13 +262,12 @@ class Trainer:
             "val_loss": val_loss,
         }, ckpt_path)
 
-        self.saved_checkpoints.append((val_loss, ckpt_path))
-        self.saved_checkpoints.sort(key=lambda x: x[0])
+        self.saved_checkpoints.append(ckpt_path)
 
-        # Keep only top K
+        # Delete oldest until we're at the limit
         while len(self.saved_checkpoints) > self.config.save_top_k:
-            _, old_path = self.saved_checkpoints.pop()
-            if old_path.exists() and old_path != ckpt_path:
+            old_path = self.saved_checkpoints.pop(0)
+            if old_path.exists():
                 old_path.unlink()
 
         if is_best:

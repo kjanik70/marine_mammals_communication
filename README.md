@@ -78,13 +78,15 @@ Re-tokenized with Descript Audio Codec (9 codebooks, ~10.4B interleaved tokens f
 | Model | Context | Params | Batch | Val Loss | Perplexity | Notes |
 |-------|---------|--------|-------|----------|------------|-------|
 | Medium SWA+MoE | 10240 | 199M | 1 (eff 8) | — | — | Completed, superseded by large |
-| **Large SWA+MoE** | **10240** | **479M** | **1 (eff 8)** | **5.335** | **~208** | **24% through epoch 0, still improving** |
+| Large SWA+MoE | 10240 | 479M | 1 (eff 8) | 5.3141 | ~203 | Stopped at step 656K; superseded by 32K medium |
+| **Medium SWA+MoE 32K** | **32768** | **375M** | **1 (eff 8)** | **—** | **—** | **16 experts, SWA=2048, gradient checkpointing (~9.7 GB); config ready** |
 
 Key observations:
 - **Chunked SWA eliminates O(T²) mask**: Training uses `is_causal=True` per chunk instead of a `(T×T)` float mask. Saves 400MB VRAM at 10K context, enables Flash Attention kernel.
 - **8-bit Adam + gradient checkpointing**: Fits the 479M-param model in 13.1GB VRAM on RTX 5070 Ti (16GB), leaving 3GB headroom.
 - **Higher perplexity expected**: Vocab is 9219 (9×1024 + PAD + SEP) vs 4099 for 4CB LAC. The model predicts finer-grained tokens across 9 codebooks.
 - **DAC 9CB generation quality**: Three bugs were fixed in the generation pipeline (extra +1 offset, wrong codec used for decoding, KV cache RoPE offset in SWA layers). After fixes: 0% codebook violations, coherent audio output.
+- **32K context (42.3s) with gradient checkpointing**: Medium 32K config uses 16 experts (375M total params) and SWA window of 2048 tokens (~2.6s local context). Gradient checkpointing reduces peak VRAM to ~9.7 GB (batch=1) vs ~18 GB without — fits comfortably in 16 GB.
 
 ### Audio Quality Grading
 
@@ -102,6 +104,33 @@ Each raw audio segment is graded A–F based on signal quality metrics (spectral
 | **Total** | **44,609** | **0.616** | **1%** | **42%** | **57%** |
 
 Quality histograms are generated in `data/quality_histograms/`.
+
+### Orca Call Detector
+
+A binary CNN classifier (`OrcaDetectorCNN`) that detects orca vocalizations in 3-second log-mel spectrogram windows. Trained from scratch because existing tools either required incompatible Python versions (orcAI requires 3.11) or had no publicly available weights (OrcaHello, ORCA-SPOT).
+
+**Architecture** (`src/detector/orca_detector.py`): 4-block CNN (32→64→128→256 channels, stride-2 convolutions), global average pooling, two-layer MLP head. ~1M parameters. Input: `(1, 128, T)` log-mel spectrogram normalized to [0, 1] (128 mel bins, n_fft=2048, hop=512, f_min=50 Hz, f_max=20 kHz, top_db=80).
+
+**Training** (`scripts/train_orca_detector.py`):
+
+| Source | Label | Windows | Notes |
+|--------|-------|---------|-------|
+| DORI-Orcasound (FLAC) | Positive | ~15K | 60s FLACs, 15 windows each |
+| ESP Orcas (WAV) | Positive | ~2K | Short orca call clips |
+| KW Prince Edward Islands | Positive | ~40 | 14-min recording |
+| Orcasound SRKW | Positive | ~9K | 10-min WAV files |
+| MBARI ambient hydrophone | Negative | ~4K | 16 kHz ambient ocean |
+| Watkins (non-orca species) | Negative | ~500 | Hard negatives: other marine mammals |
+| **Total** | | **30,418** | **26,415 pos / 4,003 neg** |
+
+Training used `WeightedRandomSampler` to balance classes, time/frequency masking augmentation, cosine LR decay (3e-4 → 0), early stopping (patience 6 epochs). **Best val_loss: 0.0002, val_acc: 100%, early stopped at epoch 15.**
+
+**Domain shift finding**: The detector trained on high-SNR curated recordings scores 1.0 on DORI/ESP/SRKW clips, but ~0 on SanctSound chunks — passive acoustic hydrophone data has much lower SNR. The signal is present but below the threshold the model learned from clean training data.
+
+**Fine-tuning for SanctSound** (`scripts/finetune_orca_detector_sanctsound.py`): Adapts the detector to low-SNR hydrophone data using in-domain examples:
+- **Positives**: windows within annotation timestamps ±30s from OC02/OC01 FLACs
+- **Negatives**: windows >180s from any annotation in the same FLACs (same noise floor, no whale calls)
+- Fine-tunes from `models/orca_detector.pt` at LR=5e-5, outputs `models/orca_detector_ft.pt`
 
 ### Codec Reconstruction Quality (LAC vs DAC)
 
@@ -379,6 +408,51 @@ The pipeline per file:
 
 Grades are computed from token-level metrics (CB0 entropy, unique token ratio, consecutive repeat ratio, codebook range usage). 95–99.5% of chunks score grade B across all stations — the whale-band CV filter effectively rejects ambient noise, leaving only vocalization-rich content. Zero D/F grades.
 
+#### Pipeline E: SanctSound Orca (annotation-guided, DAC 9CB)
+
+Downloads only the FLAC windows that overlap with manual orca call annotations, extracts those time ranges (±2s buffer), applies bandpass + optional spectral gating, and tokenizes with DAC 9CB. Uses precise start/end timestamps with ecotype labels (SRKW, NR, Transient, Unknown) — no ML detector needed.
+
+```bash
+export PYTHONPATH=.
+
+# Process all OC stations (oc01–oc04) with annotation-guided download
+python3 scripts/process_sanctsound_orca.py
+# → data/tokenized/sanctsound_orca_dac/
+
+# Single station
+python3 scripts/process_sanctsound_orca.py --station oc02
+
+# With two-pass spectral gating (experimental; can remove faint calls)
+python3 scripts/process_sanctsound_orca.py --station oc01 --denoise
+
+# Dry run (list qualifying FLACs without downloading)
+python3 scripts/process_sanctsound_orca.py --station oc01 --dry-run
+```
+
+The pipeline per FLAC:
+1. Check overlap with orca annotation CSV → skip if none
+2. Download FLAC from GCS to tmp dir
+3. Load → mono → resample to 44,100 Hz
+4. Extract annotated time ranges + 2s buffer
+5. Bandpass 80 Hz – 20 kHz
+6. Optional: two-pass spectral gating (`--denoise`)
+7. Segment into ≤30s chunks (remove >4s silence)
+8. Per-chunk: peak normalize → orca band CV/energy filter → loudness normalize
+9. Tokenize with DAC 9CB (save as 2D `(9, T)` .npy)
+10. Save scores + ecotype label to `chunk_scores.csv`, then delete FLAC
+
+**Stations processed** (4 stations, 11 deployments):
+
+| Station | Location | Deployments | Token files | Notes |
+|---------|----------|-------------|-------------|-------|
+| OC01 | Olympic Coast NMS | 1, 3 | — | Southern Resident KW |
+| OC02 | Olympic Coast NMS | 1, 2, 4, 5 | — | SRKW + Northern Resident |
+| OC03 | Olympic Coast NMS | 2, 3, 4 | — | Mixed ecotypes |
+| OC04 | Olympic Coast NMS | 2, 4 | — | Transient KW |
+| **Total** | | **11** | **8,657** | **~190M tokens, ~68 hours** |
+
+Scores are written to `chunk_scores.csv` alongside the token files for training-time filtering by ecotype, orca band CV, or energy ratio.
+
 ### 5. Train models
 
 ```bash
@@ -629,6 +703,8 @@ These presets replace most attention layers with **Sliding Window Attention** (l
 | medium_swa_moe | 12 | 12 | 768 | 8 | 768 | 2 | 1,024 | 5th layer | ~199M |
 | large_swa_moe | 16 | 16 | 1,024 | 8 | 1,024 | 2 | 1,024 | 5th layer | ~471M |
 
+> **32K config overrides**: The `audio_medium_swa_moe_..._32k` config uses `n_experts=16` (375M total params) and `swa_window_size=2048` (~2.6s local attention at 9CB token rate). Both are set in the YAML — preset defaults are overridden per-run.
+
 **Layer pattern** (example: `large_swa_moe`, 16 layers, `full_attention_every_n=5`):
 
 | Layers | Attention | FFN |
@@ -683,8 +759,11 @@ All configs are in `configs/`. Key configs:
 | `audio_medium_sanctsound_humpback_4cb.yaml` | Audio 4CB | medium | SanctSound humpback (~3.2B tokens) | LR 2e-4, batch 2, grad_accum 4, seq_len 4096, vocab 4099 |
 | `audio_large_sanctsound_humpback_4cb.yaml` | Audio 4CB | large | SanctSound humpback (~3.2B tokens) | LR 1.5e-4, batch 8, seq_len 4096, vocab 4099 |
 | `audio_large_swa_moe_sanctsound_humpback_dac_9cb_10k.yaml` | Audio DAC 9CB | large_swa_moe | SanctSound humpback (~10.4B tokens) | LR 1e-4, batch 1 (eff 8), seq_len 10240, vocab 9219, SWA+MoE |
+| `audio_medium_swa_moe_sanctsound_humpback_dac_9cb_32k.yaml` | Audio DAC 9CB | medium_swa_moe | SanctSound humpback (~10.4B tokens) | LR 1e-4, batch 1 (eff 8), seq_len 32768, 16 experts, SWA=2048, grad checkpointing |
 
 Token-level augmentation (for audio track): random token noise (±1-3), token masking, and time stretching.
+
+> **Checkpoint management**: The trainer keeps the N most recent step checkpoints (`save_top_k`, default 2) plus a separate `best_model.pt` that is always retained. Periodic saves (`save_interval`) rotate by step number — oldest checkpoint is deleted when the limit is exceeded. This prevents disk exhaustion during long runs.
 
 ## Project Structure
 
@@ -705,7 +784,8 @@ marine_mammals_communication/
 │   ├── audio_small_denoised_4cb.yaml # Audio, denoised long-chunk (small, 4CB)
 │   ├── audio_medium_sanctsound_humpback_4cb.yaml # SanctSound humpback (medium, 4CB)
 │   ├── audio_large_sanctsound_humpback_4cb.yaml  # SanctSound humpback (large, 4CB)
-│   └── audio_large_swa_moe_sanctsound_humpback_dac_9cb_10k.yaml # SanctSound humpback (large SWA+MoE, DAC 9CB)
+│   ├── audio_large_swa_moe_sanctsound_humpback_dac_9cb_10k.yaml # SanctSound humpback (large SWA+MoE, DAC 9CB)
+│   └── audio_medium_swa_moe_sanctsound_humpback_dac_9cb_32k.yaml # SanctSound humpback (medium SWA+MoE 32K, DAC 9CB)
 ├── data/
 │   ├── raw/                          # Downloaded datasets (not in git)
 │   │   ├── ceti/                     # CETI annotation CSVs
@@ -737,9 +817,12 @@ marine_mammals_communication/
 │       ├── denoised_4cb/             # Denoised long-chunk tokens (4CB)
 │       ├── sanctsound_4cb/           # SanctSound pilot tokens (4CB)
 │       ├── sanctsound_humpback_4cb/ # SanctSound humpback tokens (4CB, ~497K files)
-│       └── sanctsound_humpback_dac/ # SanctSound humpback tokens (DAC 9CB, ~488K files)
+│       ├── sanctsound_humpback_dac/ # SanctSound humpback tokens (DAC 9CB, ~488K files)
+│       └── sanctsound_orca_dac/    # SanctSound orca tokens (DAC 9CB, 8,657 files, ~190M tokens)
 ├── models/
-│   └── codec.pth                     # WhAM LAC codec weights (not in git)
+│   ├── codec.pth                     # WhAM LAC codec weights (not in git)
+│   ├── orca_detector.pt              # Trained OrcaDetectorCNN (not in git)
+│   └── orca_detector_ft.pt           # Fine-tuned on SanctSound (not in git)
 ├── runs/                             # Training outputs (not in git)
 │   ├── symbolic_tiny_coda/           # Symbolic coda model
 │   ├── symbolic_tiny_dialogue/       # Symbolic dialogue model
@@ -776,7 +859,10 @@ marine_mammals_communication/
 │   ├── process_sanctsound_humpback.py # SanctSound large-scale humpback (Pipeline D)
 │   ├── generate_prompted.py          # Generate continuations from real whale prompts
 │   ├── eval_codec_quality.py         # LAC roundtrip reconstruction quality test
-│   └── eval_codec_comparison.py      # LAC vs DAC codec comparison
+│   ├── eval_codec_comparison.py      # LAC vs DAC codec comparison
+│   ├── process_sanctsound_orca.py    # SanctSound orca: annotation-guided Pipeline E
+│   ├── train_orca_detector.py        # Train binary OrcaDetectorCNN
+│   └── finetune_orca_detector_sanctsound.py # Fine-tune detector on SanctSound low-SNR data
 ├── src/
 │   ├── data/
 │   │   ├── symbolic_tokenizer.py     # CETI annotations → tokens
@@ -788,6 +874,8 @@ marine_mammals_communication/
 │   ├── model/
 │   │   ├── config.py                 # Model size presets (tiny→xlarge)
 │   │   └── transformer.py            # Causal transformer decoder
+│   ├── detector/
+│   │   └── orca_detector.py          # OrcaDetectorCNN + OrcaDetector inference wrapper
 │   ├── training/
 │   │   └── trainer.py                # Training loop (AdamW, cosine LR, bf16)
 │   └── evaluation/
@@ -854,14 +942,27 @@ python3 scripts/process_sanctsound_humpback.py
 # → data/tokenized/sanctsound_humpback_4cb/
 python3 scripts/train.py configs/audio_medium_sanctsound_humpback_4cb.yaml
 
-# 10. Generate audio samples
+# 10. Pipeline D (DAC 9CB re-tokenization) + train medium SWA+MoE 32K
+python3 scripts/process_sanctsound_humpback.py --codec dac --save-2d
+# → data/tokenized/sanctsound_humpback_dac/
+python3 scripts/train.py configs/audio_medium_swa_moe_sanctsound_humpback_dac_9cb_32k.yaml
+
+# 11. Pipeline E: SanctSound orca (Olympic Coast, 11 deployments)
+python3 scripts/process_sanctsound_orca.py
+# → data/tokenized/sanctsound_orca_dac/
+
+# 12. Orca detector: train from scratch, then fine-tune on SanctSound
+python3 scripts/train_orca_detector.py
+python3 scripts/finetune_orca_detector_sanctsound.py
+
+# 13. Generate audio samples
 python3 scripts/generate_all.py --n-samples 5 --max-tokens 300
 
-# 11. Evaluate symbolic models
+# 14. Evaluate symbolic models
 python3 scripts/evaluate.py runs/symbolic_tiny_coda/best_model.pt --dataset-type coda
 python3 scripts/evaluate.py runs/symbolic_tiny_dialogue/best_model.pt --dataset-type dialogue
 
-# 12. Evaluate codec reconstruction quality
+# 15. Evaluate codec reconstruction quality
 python3 scripts/eval_codec_quality.py --device cpu   # LAC only, various codebook counts
 python3 scripts/eval_codec_comparison.py --device cpu # LAC vs DAC comparison
 ```
@@ -884,7 +985,6 @@ The longest consecutive run is **124 chunks (62 minutes)** of unbroken humpback 
 
 ### Additional Targets
 
-- Orca data pipeline: Process ~643 hours of manually annotated killer whale vocalizations from Olympic Coast (OC01-04) with ecotype labels (Southern Resident, Northern Resident, Transient)
 - Species-specific vs multi-species model comparison
 - Hierarchical codebook modeling (predict coarse codebooks first, then refine)
 - DolphinGemma integration (Google's dolphin communication model)

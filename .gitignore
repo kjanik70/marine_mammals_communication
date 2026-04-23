@@ -14,6 +14,16 @@ data/denoised/
 data/sanctsound/
 data/hi05_spot_check/
 data/quality_histograms/
+data/generated_samples/
+data/orca_detector_cache/
+data/orca_detector_cache_sanctsound/
+data/pipeline_test_orca/
+data/pipeline_test_orca_denoised/
+data/audio_samples/
+data/decoded_samples/
+
+# Claude project memory
+.claude/
 
 # Model weights
 models/
