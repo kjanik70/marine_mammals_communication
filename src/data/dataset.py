@@ -54,6 +54,7 @@ class _ConcatGroup:
     """Index for a group of concatenated files."""
     file_entries: list = field(default_factory=list)  # [(Path, n_tokens), ...]
     cum_offsets: list = field(default_factory=list)    # start position of each file
+    sep_tokens: list = field(default_factory=list)     # sep token per boundary (len = n_files - 1)
     total_length: int = 0
 
 
@@ -223,6 +224,8 @@ class AudioTokenDataset(Dataset):
         time_stretch_prob: float = 0.3,
         concat: bool = False,
         sep_token: int | None = None,
+        sep_gap_token: int | None = None,
+        adjacency_file: str | Path | None = None,
         codebook_index: int | None = None,
         interleave_codebooks: int | None = None,
         score_file: str | Path | None = None,
@@ -237,6 +240,7 @@ class AudioTokenDataset(Dataset):
         self.time_stretch_prob = time_stretch_prob
         self.concat = concat
         self.sep_token = sep_token
+        self.sep_gap_token = sep_gap_token if sep_gap_token is not None else sep_token
         self.codebook_index = codebook_index
         self.interleave_codebooks = interleave_codebooks
 
@@ -279,6 +283,18 @@ class AudioTokenDataset(Dataset):
         self._file_list = []   # non-concat mode: list of (Path, n_tokens)
         self._windows = []     # list of (source_idx, start, end) tuples
 
+        # Load adjacency lookup: {npy_filename: (flac_name, chunk_idx_in_flac)}
+        self._adjacency: dict = {}
+        if concat and sep_gap_token is not None and adjacency_file is not None:
+            import csv
+            with open(adjacency_file) as f:
+                for row in csv.DictReader(f):
+                    npy = row.get('npy_file', '')
+                    flac = row.get('flac_name', '')
+                    idx = row.get('chunk_idx_in_flac', '')
+                    if npy and flac and idx:
+                        self._adjacency[npy] = (flac, int(idx))
+
         if concat and sep_token is not None:
             self._build_concat_index(scanned, max_seq_len)
         else:
@@ -293,6 +309,9 @@ class AudioTokenDataset(Dataset):
             prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else stem
             groups.setdefault(prefix, []).append((path, n_tokens))
 
+        n_adjacent = 0
+        n_gap = 0
+
         for prefix in sorted(groups):
             files = groups[prefix]
             group = _ConcatGroup()
@@ -302,6 +321,21 @@ class AudioTokenDataset(Dataset):
                 group.cum_offsets.append(pos)
                 pos += n_tokens
                 if i < len(files) - 1:
+                    # Determine adjacency: same source FLAC and sequential chunk index
+                    if self._adjacency:
+                        info_i = self._adjacency.get(path.name)
+                        info_j = self._adjacency.get(files[i + 1][0].name)
+                        is_adj = (info_i and info_j
+                                  and info_i[0] == info_j[0]
+                                  and info_j[1] == info_i[1] + 1)
+                        sep_tok = self.sep_token if is_adj else self.sep_gap_token
+                        if is_adj:
+                            n_adjacent += 1
+                        else:
+                            n_gap += 1
+                    else:
+                        sep_tok = self.sep_token
+                    group.sep_tokens.append(sep_tok)
                     pos += 1  # SEP token between files
             group.total_length = pos
 
@@ -317,6 +351,10 @@ class AudioTokenDataset(Dataset):
                 for start in range(0, total - max_seq_len, stride):
                     self._windows.append((group_idx, start, start + max_seq_len + 1))
                 self._windows.append((group_idx, total - max_seq_len - 1, total))
+
+        if self._adjacency and (n_adjacent + n_gap) > 0:
+            print(f"SEP boundaries: {n_adjacent} adjacent ({n_adjacent*100//(n_adjacent+n_gap)}%), "
+                  f"{n_gap} gap ({n_gap*100//(n_adjacent+n_gap)}%)")
 
     def _build_simple_index(self, scanned, max_seq_len):
         """Build window index for non-concat mode (each file independent)."""
@@ -367,7 +405,8 @@ class AudioTokenDataset(Dataset):
             if fi > first:
                 sep_pos = offsets[fi] - 1  # SEP sits just before this file
                 if start <= sep_pos < end:
-                    pieces.append(np.array([self.sep_token], dtype=np.int16))
+                    sep_tok = group.sep_tokens[fi - 1] if group.sep_tokens else self.sep_token
+                    pieces.append(np.array([sep_tok], dtype=np.int16))
 
             # Slice of this file that falls within [start, end)
             lo = max(0, start - file_start)

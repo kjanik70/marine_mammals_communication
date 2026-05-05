@@ -50,6 +50,8 @@ def main():
             vocab_size=vocab_size,
             concat=concat,
             sep_token=sep_token,
+            sep_gap_token=cfg["data"].get("sep_gap_token", None),
+            adjacency_file=cfg["data"].get("adjacency_file", None),
             codebook_index=codebook_index,
             interleave_codebooks=interleave_codebooks,
             score_file=cfg["data"].get("score_file", None),

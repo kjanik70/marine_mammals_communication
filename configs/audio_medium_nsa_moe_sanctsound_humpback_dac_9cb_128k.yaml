@@ -36,7 +36,9 @@ data:
   max_seq_len: 131072
   interleave_codebooks: 9
   concat: true
-  sep_token: 9218
+  sep_token: 9218        # adjacent boundary (same FLAC, sequential 30s chunks)
+  sep_gap_token: 9217   # discontinuous boundary (different FLACs or non-sequential)
+  adjacency_file: data/tokenized/sanctsound_humpback_dac/chunk_scores.csv
   augment: false
   score_file: data/tokenized/sanctsound_humpback_dac/chunk_scores.csv
   min_detector_score: 0.7
