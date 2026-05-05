@@ -23,11 +23,12 @@ model:
   compressed_attn_stride: 72   # 8 timesteps × 9 codebooks — codebook-boundary aligned
   compressed_attn_chunk: 2048  # query chunk size for O(chunk × T_c) peak memory
   n_experts: 16
-  moe_top_k: 2
+  moe_top_k: 1    # top-1 routing: halves MoE activation memory (1.1 GB savings at 128K)
   expert_d_ff: 768
   moe_aux_weight: 0.0       # disabled — bias routing handles load balancing
   use_bias_routing: true
   use_gradient_checkpointing: true
+  use_split_qkv: true       # separate q/k/v projections — saves ~380 MB/block during recompute
 
 data:
   dataset_type: audio

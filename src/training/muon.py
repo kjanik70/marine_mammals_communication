@@ -78,11 +78,14 @@ class Muon(torch.optim.Optimizer):
 
                 state = self.state[p]
                 if "momentum_buffer" not in state:
-                    # bf16 momentum halves buffer memory (1.47 GB → 0.74 GB for 368M params)
-                    state["momentum_buffer"] = torch.zeros_like(g, dtype=torch.bfloat16)
+                    # CPU-resident bf16 buffer: keeps 0.74 GB off the GPU during backward.
+                    # Momentum is only needed at step() time, not during the backward pass.
+                    state["momentum_buffer"] = torch.zeros(p.shape, dtype=torch.bfloat16, device="cpu")
 
-                buf = state["momentum_buffer"]
+                # Move to GPU only for the duration of this step, then return to CPU.
+                buf = state["momentum_buffer"].to(g.device)
                 buf.mul_(momentum).add_(g.to(torch.bfloat16))
+                state["momentum_buffer"] = buf.to("cpu", non_blocking=True)
 
                 update = g.to(torch.bfloat16).add(buf, alpha=momentum) if nesterov else buf.clone()
 

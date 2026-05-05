@@ -64,7 +64,13 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = config.n_heads
         self.d_head = config.d_head
         self.d_model = config.d_model
-        self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.split_qkv = getattr(config, 'use_split_qkv', False)
+        if self.split_qkv:
+            self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.k_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        else:
+            self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -78,9 +84,13 @@ class CausalSelfAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
-        # Project to Q, K, V
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.split(self.d_model, dim=-1)
+        if self.split_qkv:
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+        else:
+            qkv = self.qkv_proj(x)
+            q, k, v = qkv.split(self.d_model, dim=-1)
 
         # Reshape to (B, n_heads, T, d_head)
         q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
@@ -130,11 +140,16 @@ class SlidingWindowAttention(nn.Module):
         self.d_head = config.d_head
         self.d_model = config.d_model
         self.window_size = config.swa_window_size
+        self.split_qkv = getattr(config, 'use_split_qkv', False)
 
-        self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        if self.split_qkv:
+            self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.k_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        else:
+            self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
-
 
     def forward(
         self,
@@ -146,8 +161,13 @@ class SlidingWindowAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.split(self.d_model, dim=-1)
+        if self.split_qkv:
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+        else:
+            qkv = self.qkv_proj(x)
+            q, k, v = qkv.split(self.d_model, dim=-1)
 
         q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
@@ -247,7 +267,13 @@ class CompressedGlobalAttention(nn.Module):
         self.d_model = config.d_model
         self.stride = config.compressed_attn_stride
         self.chunk = config.compressed_attn_chunk
-        self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.split_qkv = getattr(config, 'use_split_qkv', False)
+        if self.split_qkv:
+            self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.k_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        else:
+            self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -263,8 +289,13 @@ class CompressedGlobalAttention(nn.Module):
         H, D = self.n_heads, self.d_head
         S = self.stride
 
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.split(self.d_model, dim=-1)
+        if self.split_qkv:
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+        else:
+            qkv = self.qkv_proj(x)
+            q, k, v = qkv.split(self.d_model, dim=-1)
 
         q = q.view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
         k = k.view(B, T, H, D).transpose(1, 2)

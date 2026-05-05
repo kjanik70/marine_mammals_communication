@@ -35,6 +35,12 @@ class TransformerConfig:
     compressed_attn_stride: int = 0    # 0 = use full attention for global layers
     compressed_attn_chunk: int = 2048  # query chunk size for memory-bounded computation
 
+    # Split QKV projections: use separate q_proj/k_proj/v_proj instead of fused qkv_proj.
+    # Reduces backward activation peak by ~380 MB per block recomputation by avoiding
+    # the 576 MB fused tensor that is kept alive because v is a view of it.
+    # Required for 128K context on 16 GB VRAM. Incompatible with fused-QKV checkpoints.
+    use_split_qkv: bool = False
+
     @property
     def d_head(self) -> int:
         return self.d_model // self.n_heads
