@@ -198,18 +198,131 @@ class SlidingWindowAttention(nn.Module):
                         outputs.append(out_chunk)
                     attn_out = torch.cat(outputs, dim=2)
             else:
-                # Eval/generation prefill: exact SWA mask computed on the fly.
-                # Chunked SWA sees up to 2W context (not exactly W) which
-                # changes hidden states enough to break generation quality.
+                # Eval (loss computation): same chunked approach as training.
+                # Generation always uses the kv_cache branch above, so this
+                # path is never hit for autoregressive decoding.
                 if T <= W:
                     attn_out = F.scaled_dot_product_attention(
                         q, k, v, is_causal=True, dropout_p=0.0)
                 else:
-                    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=q.device))
-                    mask = torch.triu(mask, diagonal=-(W - 1))
-                    swa_mask = torch.where(mask, 0.0, float('-inf'))
-                    attn_out = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=swa_mask, dropout_p=0.0)
+                    n_chunks = (T + W - 1) // W
+                    outputs = []
+                    for c in range(n_chunks):
+                        q_start = c * W
+                        q_end = min((c + 1) * W, T)
+                        k_start = max(0, (c - 1) * W)
+                        k_end = q_end
+                        outputs.append(F.scaled_dot_product_attention(
+                            q[:, :, q_start:q_end, :],
+                            k[:, :, k_start:k_end, :],
+                            v[:, :, k_start:k_end, :],
+                            is_causal=True, dropout_p=0.0))
+                    attn_out = torch.cat(outputs, dim=2)
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.out_proj(attn_out), new_cache
+
+
+class CompressedGlobalAttention(nn.Module):
+    """Causal global attention over stride-compressed K/V (NSA-style).
+
+    Every global attention layer, K and V are downsampled by taking every
+    `stride`-th token, reducing attended context from T to T//stride tokens.
+    Queries remain full-resolution.
+
+    Causal rule: query at position i may attend to compressed key j
+    only when j * stride <= i.  The mask is built per query-chunk so peak
+    memory is O(chunk_size × T_c) regardless of total sequence length.
+
+    For stride=72 and seq_len=128K:
+      T_c ≈ 1820 anchors spanning ~169s of audio (~0.093s per anchor).
+      Peak SDPA memory per chunk: O(2048 × 1820) ≈ 90 MB for all heads —
+      vs O(128K²) ≈ 200 GB for naive full attention.
+    """
+
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.n_heads = config.n_heads
+        self.d_head = config.d_head
+        self.d_model = config.d_model
+        self.stride = config.compressed_attn_stride
+        self.chunk = config.compressed_attn_chunk
+        self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+        B, T, C = x.shape
+        H, D = self.n_heads, self.d_head
+        S = self.stride
+
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(self.d_model, dim=-1)
+
+        q = q.view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
+        k = k.view(B, T, H, D).transpose(1, 2)
+        v = v.view(B, T, H, D).transpose(1, 2)
+
+        # Apply RoPE to Q and K at their original sequence positions
+        cos_t = cos[:, :T, :, :].transpose(1, 2)  # (1, 1, T, D)
+        sin_t = sin[:, :T, :, :].transpose(1, 2)
+        q = apply_rope(q, cos_t, sin_t)
+        k = apply_rope(k, cos_t, sin_t)
+
+        if kv_cache is not None:
+            # Generation: full-resolution K/V cache; compress on the fly for attention
+            cached_k, cached_v = kv_cache
+            k = torch.cat([cached_k, k], dim=2)
+            v = torch.cat([cached_v, v], dim=2)
+            new_cache = (k, v)
+            k_c = k[:, :, ::S, :]  # (B, H, T_c, D)
+            v_c = v[:, :, ::S, :]
+            # Single new query token — sees all past compressed keys, no mask needed
+            attn_out = F.scaled_dot_product_attention(q, k_c, v_c, dropout_p=0.0)
+        else:
+            new_cache = (k, v)
+            # Compress K/V: take every S-th position (aligned to original positions)
+            k_c = k[:, :, ::S, :]  # (B, H, T_c, D)
+            v_c = v[:, :, ::S, :]
+            T_c = k_c.shape[2]
+
+            # Process Q in chunks to bound peak attention memory
+            CQ = self.chunk
+            outputs = []
+            for q_start in range(0, T, CQ):
+                q_end = min(q_start + CQ, T)
+                q_ch = q[:, :, q_start:q_end, :]  # (B, H, cq, D)
+                cq = q_end - q_start
+
+                # Compressed keys accessible to this chunk:
+                # key j (at position j*S) is accessible if j*S <= q_end - 1
+                n_keys = min((q_end - 1) // S + 1, T_c)
+                k_ch = k_c[:, :, :n_keys, :]
+                v_ch = v_c[:, :, :n_keys, :]
+
+                # Causal mask: query at global position i sees key j iff j*S <= i
+                query_pos = torch.arange(q_start, q_end, device=x.device)  # (cq,)
+                key_pos = torch.arange(n_keys, device=x.device) * S         # (n_keys,)
+                # True = mask out (future)
+                causal = key_pos.unsqueeze(0) > query_pos.unsqueeze(1)  # (cq, n_keys)
+                bias = x.new_zeros(1, 1, cq, n_keys)
+                bias = bias.masked_fill(causal.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+                out_ch = F.scaled_dot_product_attention(
+                    q_ch, k_ch, v_ch,
+                    attn_mask=bias,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                )
+                outputs.append(out_ch)
+
+            attn_out = torch.cat(outputs, dim=2)  # (B, H, T, D)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(attn_out), new_cache
@@ -240,8 +353,13 @@ class MoEFeedForward(nn.Module):
         super().__init__()
         self.n_experts = config.n_experts
         self.top_k = config.moe_top_k
+        self.use_bias_routing = getattr(config, 'use_bias_routing', False)
 
         self.gate = nn.Linear(config.d_model, config.n_experts, bias=False)
+
+        # Bias routing (DeepSeek V4-style): per-expert learned bias instead of aux_loss
+        if self.use_bias_routing:
+            self.expert_bias = nn.Parameter(torch.zeros(config.n_experts))
 
         # Build experts with controllable size
         expert_ff = config.expert_d_ff if config.expert_d_ff > 0 else config.d_ff
@@ -256,21 +374,27 @@ class MoEFeedForward(nn.Module):
         x_flat = x.view(-1, D)
         N = x_flat.shape[0]
 
-        # Router
+        # Router: optionally add per-expert bias for load balancing
         logits = self.gate(x_flat)  # (N, n_experts)
+        if self.use_bias_routing:
+            logits = logits + self.expert_bias
         top_k_logits, top_k_idx = logits.topk(self.top_k, dim=-1)
         top_k_weights = F.softmax(top_k_logits, dim=-1)  # (N, top_k)
 
-        # Load-balancing auxiliary loss
-        router_probs = F.softmax(logits, dim=-1)
-        tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
-        for k in range(self.top_k):
-            tokens_per_expert.scatter_add_(
-                0, top_k_idx[:, k],
-                torch.ones(N, device=x.device))
-        f = tokens_per_expert / tokens_per_expert.sum()
-        P = router_probs.mean(dim=0)
-        self._aux_loss = self.n_experts * (f * P).sum()
+        if self.use_bias_routing:
+            # Bias routing: no auxiliary loss — expert_bias handles load balancing
+            self._aux_loss = x_flat.new_zeros(())
+        else:
+            # Switch Transformer auxiliary loss for load balancing
+            router_probs = F.softmax(logits, dim=-1)
+            tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
+            for k in range(self.top_k):
+                tokens_per_expert.scatter_add_(
+                    0, top_k_idx[:, k],
+                    torch.ones(N, device=x.device))
+            f = tokens_per_expert / tokens_per_expert.sum()
+            P = router_probs.mean(dim=0)
+            self._aux_loss = self.n_experts * (f * P).sum()
 
         # Dispatch to experts
         output = torch.zeros_like(x_flat)
@@ -301,11 +425,24 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attn_norm = nn.RMSNorm(config.d_model)
 
-        # SWA vs full attention (controllable ratio)
+        # Attention type per layer:
+        #  - Local layers: SlidingWindowAttention (when swa_window_size > 0)
+        #  - Global layers (every full_attention_every_n):
+        #      * CompressedGlobalAttention when compressed_attn_stride > 0 (NSA-style)
+        #      * CausalSelfAttention otherwise (full O(T²) attention)
+        is_global = (config.full_attention_every_n > 0 and
+                     (layer_idx + 1) % config.full_attention_every_n == 0)
+        use_compressed = (is_global and
+                          getattr(config, 'compressed_attn_stride', 0) > 0)
         use_swa = (config.swa_window_size > 0 and
-                   config.full_attention_every_n > 0 and
-                   (layer_idx + 1) % config.full_attention_every_n != 0)
-        self.attn = SlidingWindowAttention(config) if use_swa else CausalSelfAttention(config)
+                   config.full_attention_every_n > 0 and not is_global)
+
+        if use_compressed:
+            self.attn = CompressedGlobalAttention(config)
+        elif use_swa:
+            self.attn = SlidingWindowAttention(config)
+        else:
+            self.attn = CausalSelfAttention(config)
 
         self.ff_norm = nn.RMSNorm(config.d_model)
 
@@ -398,12 +535,12 @@ class CausalTransformer(nn.Module):
                 x, _ = checkpoint(block, x, cos, sin, attention_mask, None, use_reentrant=False)
             else:
                 x, cache = block(x, cos, sin, attention_mask, layer_cache)
-                new_kv.append(cache)
+                if targets is None:  # only accumulate KV cache for generation, not eval/training
+                    new_kv.append(cache)
 
         x = self.norm(x)
-        logits = self.lm_head(x)
 
-        result = {"logits": logits}
+        result = {}
 
         if new_kv:
             result["past_kv"] = new_kv
@@ -415,13 +552,41 @@ class CausalTransformer(nn.Module):
             result["aux_loss"] = sum(aux_losses)
 
         if targets is not None:
-            # Flatten for cross entropy, ignore padding (target == 0)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=0,  # PAD token
-            )
-            result["loss"] = loss
+            # Gradient-checkpointed chunked cross-entropy: each chunk's logit
+            # tensor is never retained in the autograd graph — it's freed after
+            # the chunk forward and recomputed during backward.  This keeps peak
+            # VRAM at O(chunk × vocab) rather than O(seq_len × vocab), which is
+            # critical at 128K context (2.4 GB in bf16 if retained naively).
+            flat_x = x.view(-1, x.size(-1))
+            flat_targets = targets.view(-1)
+            chunk = 2048
+            total_loss = x.new_zeros(())
+            n_valid = 0
+            weight = self.lm_head.weight
+
+            def _ce_chunk(x_c, t_c, w):
+                return F.cross_entropy(
+                    F.linear(x_c, w), t_c,
+                    ignore_index=0, reduction="sum",
+                )
+
+            for s in range(0, flat_x.size(0), chunk):
+                e = min(s + chunk, flat_x.size(0))
+                tgt_chunk = flat_targets[s:e]
+                valid = (tgt_chunk != 0).sum().item()
+                if valid == 0:
+                    continue
+                chunk_loss = checkpoint(
+                    _ce_chunk, flat_x[s:e], tgt_chunk, weight,
+                    use_reentrant=False,
+                )
+                total_loss = total_loss + chunk_loss
+                n_valid += valid
+            result["loss"] = total_loss / max(n_valid, 1)
+            result["logits"] = None
+        else:
+            logits = self.lm_head(x)
+            result["logits"] = logits
 
         return result
 

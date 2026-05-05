@@ -43,4 +43,5 @@ training:
   save_interval: 2000
   patience: 30
   save_top_k: 2
+  use_8bit_adam: true
   output_dir: runs/audio_medium_swa_moe_sanctsound_humpback_dac_9cb_32k

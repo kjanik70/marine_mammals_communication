@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.model.transformer import CausalTransformer
+from src.training.muon import Muon
 
 
 @dataclass
@@ -47,6 +48,10 @@ class TrainConfig:
     # Memory optimization
     use_8bit_adam: bool = False   # Use bitsandbytes 8-bit Adam to reduce VRAM
 
+    # Muon optimizer (DeepSeek V4-inspired)
+    use_muon: bool = False        # Muon for 2D weight matrices + AdamW for the rest
+    muon_lr: float = 0.01        # Constant LR for Muon (not cosine-annealed)
+
 
 def get_lr(step: int, config: TrainConfig, total_steps: int = 0) -> float:
     """Cosine annealing with warmup."""
@@ -81,18 +86,57 @@ class Trainer:
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Optimizer
-        param_groups = [
-            {"params": [p for n, p in model.named_parameters() if "norm" not in n and p.requires_grad],
-             "weight_decay": config.weight_decay},
-            {"params": [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad],
-             "weight_decay": 0.0},
-        ]
+        # Optimizer setup
+        # When use_muon=True: Muon handles 2D weight matrices (attention + FFN weights),
+        # AdamW handles everything else (embeddings, norms, biases, expert_bias, lm_head).
+        self.muon_optimizer: Optional[Muon] = None
+
+        if getattr(config, 'use_muon', False):
+            muon_params, adamw_wd_params, adamw_no_wd_params = [], [], []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                # 2D matrices that are not embeddings or the (weight-tied) lm_head
+                if (param.ndim == 2
+                        and 'token_emb' not in name
+                        and 'lm_head' not in name):
+                    muon_params.append(param)
+                elif 'norm' in name or param.ndim < 2:
+                    adamw_no_wd_params.append(param)
+                else:
+                    # token_emb, lm_head (weight-tied), any remaining 2D+ non-matrix
+                    adamw_wd_params.append(param)
+
+            print(f"  Muon params:  {sum(p.numel() for p in muon_params):,}")
+            print(f"  AdamW params: {sum(p.numel() for p in adamw_wd_params + adamw_no_wd_params):,}")
+
+            self.muon_optimizer = Muon(
+                muon_params,
+                lr=config.muon_lr,
+                momentum=0.95,
+                nesterov=True,
+            )
+            adamw_groups = [
+                {"params": adamw_wd_params,    "weight_decay": config.weight_decay},
+                {"params": adamw_no_wd_params, "weight_decay": 0.0},
+            ]
+        else:
+            adamw_groups = [
+                {"params": [p for n, p in model.named_parameters()
+                            if "norm" not in n and p.requires_grad],
+                 "weight_decay": config.weight_decay},
+                {"params": [p for n, p in model.named_parameters()
+                            if "norm" in n and p.requires_grad],
+                 "weight_decay": 0.0},
+            ]
+
         if getattr(config, 'use_8bit_adam', False):
             import bitsandbytes as bnb
-            self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=config.learning_rate, betas=(0.9, 0.95))
+            self.optimizer = bnb.optim.AdamW8bit(
+                adamw_groups, lr=config.learning_rate, betas=(0.9, 0.95))
         else:
-            self.optimizer = torch.optim.AdamW(param_groups, lr=config.learning_rate, betas=(0.9, 0.95))
+            self.optimizer = torch.optim.AdamW(
+                adamw_groups, lr=config.learning_rate, betas=(0.9, 0.95))
 
         # Logging
         self.log_file = self.output_dir / "training_log.jsonl"
@@ -126,6 +170,8 @@ class Trainer:
             resume_step, resume_path, ckpt = candidates[-1]
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if self.muon_optimizer is not None and "muon_state_dict" in ckpt:
+                self.muon_optimizer.load_state_dict(ckpt["muon_state_dict"])
             self.best_val_loss = ckpt["val_loss"]
             self._resume_step = resume_step
             print(f"  Resuming from {resume_path.name} (step {resume_step}, val_loss {ckpt['val_loss']:.4f})")
@@ -168,7 +214,14 @@ class Trainer:
                 if (step + 1) % self.config.grad_accumulation_steps == 0:
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     self.optimizer.step()
+                    if self.muon_optimizer is not None:
+                        self.muon_optimizer.step()
                     self.optimizer.zero_grad()
+                    if self.muon_optimizer is not None:
+                        self.muon_optimizer.zero_grad()
+                    # Flush allocator fragment cache to prevent long-run OOM from
+                    # fragmentation accumulation (cuMemRetain blocks grow over many steps).
+                    torch.cuda.empty_cache()
 
                 # Logging
                 if step % self.config.log_interval == 0:
@@ -191,6 +244,7 @@ class Trainer:
 
                 # Evaluation
                 if self.val_loader and step > 0 and step % self.config.eval_interval == 0:
+                    torch.cuda.empty_cache()
                     val_loss = self.evaluate()
                     print(f"  -> Val loss: {val_loss:.4f} (best: {self.best_val_loss:.4f})")
 
@@ -254,13 +308,16 @@ class Trainer:
     def save_checkpoint(self, step: int, val_loss: float, is_best: bool = False):
         """Save model checkpoint, keeping only the N most recent on disk."""
         ckpt_path = self.output_dir / f"checkpoint_step{step}.pt"
-        torch.save({
+        ckpt = {
             "step": step,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "config": self.model.config,
             "val_loss": val_loss,
-        }, ckpt_path)
+        }
+        if self.muon_optimizer is not None:
+            ckpt["muon_state_dict"] = self.muon_optimizer.state_dict()
+        torch.save(ckpt, ckpt_path)
 
         self.saved_checkpoints.append(ckpt_path)
 

@@ -25,7 +25,15 @@ class TransformerConfig:
     n_experts: int = 1            # 1 = dense FFN, >1 = MoE on all layers
     moe_top_k: int = 2            # Experts selected per token
     expert_d_ff: int = 0          # Expert intermediate dim (0 = use d_ff)
-    moe_aux_weight: float = 0.01  # Load-balancing loss weight
+    moe_aux_weight: float = 0.01  # Load-balancing loss weight (ignored when use_bias_routing=True)
+    use_bias_routing: bool = False # Per-expert learned bias instead of aux_loss (DeepSeek V4-style)
+
+    # Compressed global attention (NSA-style, DeepSeek V4-inspired)
+    # When compressed_attn_stride > 0, global layers (every full_attention_every_n) use
+    # strided-compressed K/V instead of full O(T²) attention.
+    # stride=72 = 8 audio timesteps × 9 codebooks → 1820 anchors across 128K context.
+    compressed_attn_stride: int = 0    # 0 = use full attention for global layers
+    compressed_attn_chunk: int = 2048  # query chunk size for memory-bounded computation
 
     @property
     def d_head(self) -> int:
@@ -84,6 +92,20 @@ LARGE_SWA_MOE = TransformerConfig(
     use_gradient_checkpointing=True,
 )
 
+MEDIUM_NSA_MOE = TransformerConfig(
+    # Same width/depth as MEDIUM_SWA_MOE; differs in attention and routing.
+    n_layers=12, n_heads=12, d_model=768, d_ff=3072,
+    # Local: SWA with 2048-token window (~2.6s at 775 tokens/sec interleaved)
+    swa_window_size=2048, full_attention_every_n=5,
+    # Global: compressed attention — stride 72 = 8 audio timesteps × 9 codebooks
+    # At 128K context → ~1820 anchor positions covering ~169s of audio
+    compressed_attn_stride=72, compressed_attn_chunk=2048,
+    # MoE: 16 experts, top-2, bias routing (no aux_loss)
+    n_experts=16, moe_top_k=2, expert_d_ff=768,
+    moe_aux_weight=0.0, use_bias_routing=True,
+    use_gradient_checkpointing=True,
+)
+
 PRESETS = {
     "tiny": TINY,
     "small": SMALL,
@@ -93,6 +115,7 @@ PRESETS = {
     "small_swa_moe": SMALL_SWA_MOE,
     "medium_swa_moe": MEDIUM_SWA_MOE,
     "large_swa_moe": LARGE_SWA_MOE,
+    "medium_nsa_moe": MEDIUM_NSA_MOE,
 }
 
 

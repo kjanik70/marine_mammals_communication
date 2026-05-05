@@ -159,6 +159,8 @@ def main():
         patience=cfg["training"].get("patience", 20),
         max_eval_batches=cfg["training"].get("max_eval_batches", 0),
         use_8bit_adam=cfg["training"].get("use_8bit_adam", False),
+        use_muon=cfg["training"].get("use_muon", False),
+        muon_lr=cfg["training"].get("muon_lr", 0.01),
         output_dir=cfg["training"]["output_dir"],
     )
 

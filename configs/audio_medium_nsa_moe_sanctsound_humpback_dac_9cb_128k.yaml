@@ -1,0 +1,61 @@
+# Audio: Medium NSA+MoE — SanctSound humpback, DAC 9CB, 128K context
+#
+# DeepSeek V4-inspired architecture:
+#   - Compressed global attention (NSA-style): every 5th layer attends to
+#     stride-72 compressed K/V instead of full O(T²) attention.
+#     stride=72 = 8 audio timesteps × 9 codebooks → 1820 anchors per 128K window.
+#     Memory cost: O(chunk × 1820) vs O(128K²) — same budget as 32K full attn.
+#   - Bias routing MoE: per-expert learned bias replaces aux_loss penalty.
+#   - Muon optimizer: Newton-Schulz orthogonalization for 2D weight matrices.
+#
+# Context: 131072 tokens = 14,563 audio timesteps = ~169s (~2.8 min) per window
+# Tokenization: 9-codebook interleaved DAC, 44100 Hz / 512 hop = 86.1 tok/s/CB
+#               775.2 interleaved tokens/sec
+# Dataset: data/tokenized/sanctsound_humpback_dac (488K files, 9 stations)
+
+model:
+  preset: medium_nsa_moe
+  vocab_size: 9219          # 9×1024 + PAD(0) + offset(+1) + SEP(9218)
+  max_seq_len: 131072       # 128K tokens = ~169s audio
+  dropout: 0.1
+  swa_window_size: 2048     # local window: ~2.6s
+  full_attention_every_n: 5 # every 5th layer = global (2 global layers in 12)
+  compressed_attn_stride: 72   # 8 timesteps × 9 codebooks — codebook-boundary aligned
+  compressed_attn_chunk: 2048  # query chunk size for O(chunk × T_c) peak memory
+  n_experts: 16
+  moe_top_k: 2
+  expert_d_ff: 768
+  moe_aux_weight: 0.0       # disabled — bias routing handles load balancing
+  use_bias_routing: true
+  use_gradient_checkpointing: true
+
+data:
+  dataset_type: audio
+  token_dir: data/tokenized/sanctsound_humpback_dac
+  max_seq_len: 131072
+  interleave_codebooks: 9
+  concat: true
+  sep_token: 9218
+  augment: false
+  score_file: data/tokenized/sanctsound_humpback_dac/chunk_scores.csv
+  min_detector_score: 0.7
+
+training:
+  learning_rate: 1.0e-4     # cosine-annealed AdamW LR
+  weight_decay: 0.15
+  batch_size: 1
+  val_batch_size: 1
+  grad_accumulation_steps: 8   # effective batch = 8 windows = 8 × 169s
+  max_eval_batches: 50         # cap eval (128K windows are 4× larger than 32K)
+  num_epochs: 100
+  warmup_steps: 1000
+  min_lr_ratio: 0.01
+  log_interval: 50
+  eval_interval: 1000
+  save_interval: 2000
+  patience: 30
+  save_top_k: 2
+  use_8bit_adam: true          # 8-bit Adam for AdamW param group
+  use_muon: true               # Muon for 2D weight matrices
+  muon_lr: 0.01                # constant (not cosine-annealed)
+  output_dir: runs/audio_medium_nsa_moe_sanctsound_humpback_dac_9cb_128k
