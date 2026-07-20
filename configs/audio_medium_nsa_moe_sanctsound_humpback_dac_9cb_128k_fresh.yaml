@@ -1,4 +1,5 @@
 # Audio: Medium NSA+MoE — SanctSound humpback, DAC 9CB, 128K context
+# Fresh run: starting from best checkpoint (step 109000) with clean optimizer
 #
 # DeepSeek V4-inspired architecture:
 #   - Compressed global attention (NSA-style): every 5th layer attends to
@@ -54,11 +55,11 @@ training:
   warmup_steps: 1000
   min_lr_ratio: 1.0          # keep LR constant after warmup (no decay)
   log_interval: 50
-  eval_interval: 1000        # eval every 1000 steps
+  eval_interval: 1000
   save_interval: 2000
   patience: 30
   save_top_k: 2
   use_8bit_adam: true          # 8-bit Adam for AdamW param group
   use_muon: true               # Muon for 2D weight matrices
   muon_lr: 0.01                # constant (not cosine-annealed)
-  output_dir: runs/audio_medium_nsa_moe_sanctsound_humpback_dac_9cb_128k
+  output_dir: runs/audio_medium_nsa_moe_sanctsound_humpback_dac_9cb_128k_fresh
